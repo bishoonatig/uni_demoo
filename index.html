@@ -92,6 +92,13 @@
     table { width: 100%; border-collapse: collapse; text-align: left; font-size: 12px; }
     th { position: sticky; top: 0; background: var(--paper); color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .5px; }
     th, td { padding: 9px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+    .row-actions { width: 82px; text-align: center; }
+    .icon-actions { display: inline-flex; align-items: center; gap: 5px; }
+    .icon-button { display: grid; place-items: center; width: 30px; height: 30px; padding: 0; border: 1px solid var(--line); border-radius: 5px; background: white; color: var(--green-dark); font-size: 16px; }
+    .icon-button:hover { background: var(--soft); border-color: #a9c8b7; }
+    .icon-button svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
+    .icon-button.danger { color: var(--coral); }
+    .icon-button.danger:hover { background: #fff0ed; border-color: #e6b2a7; }
     .generator { background: var(--surface); border: 1px solid var(--line); border-top: 4px solid var(--green); padding: 20px; }
     .generator-bar { display: flex; align-items: end; gap: 12px; margin: 19px 0 18px; }
     .generator-bar .field { flex: 1; }
@@ -99,18 +106,21 @@
     .status { min-height: 20px; color: var(--muted); font-size: 12px; }
     .status.error { color: var(--coral); }
     .status.success { color: var(--green-dark); }
-    .schedule-wrap { overflow: auto; margin-top: 12px; }
+    .schedule-wrap { overflow: auto; margin-top: 12px; border: 1px solid #cbd8d1; border-radius: 8px; background: white; box-shadow: 0 8px 22px rgba(23, 37, 34, .06); }
     .schedule-toolbar { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin-top: 18px; }
     .schedule-toolbar .field { min-width: 190px; flex: 1; }
-    .schedule-table { min-width: 820px; table-layout: fixed; }
-    .schedule-table th { position: static; background: #edf3ef; text-align: center; }
-    .schedule-table td { height: 105px; padding: 6px; white-space: normal; vertical-align: top; }
-    .schedule-table .day-cell { width: 120px; background: #e7efeb; font-weight: 700; }
-    .schedule-period { color: var(--muted); display: block; font-size: 11px; font-weight: 500; margin-top: 4px; }
-    .schedule-card { background: #e5f0eb; border-left: 3px solid var(--green); padding: 7px; font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
+    .schedule-table { min-width: 820px; table-layout: fixed; border-collapse: separate; border-spacing: 0; }
+    .schedule-table th { position: static; background: linear-gradient(180deg, #edf4f0, #e5eee9); text-align: center; border-bottom: 2px solid #bdcec4; border-right: 2px solid #d4dfd9; padding: 13px 8px; }
+    .schedule-table th:last-child, .schedule-table td:last-child { border-right: 0; }
+    .schedule-table td { height: 105px; padding: 7px; white-space: normal; vertical-align: top; border-right: 2px solid #e0e8e3; border-bottom: 2px solid #d4dfd9; }
+    .schedule-table tbody tr:last-child td { border-bottom: 0; }
+    .schedule-table tbody tr:nth-child(even) td:not(.day-cell) { background: #fbfcfb; }
+    .schedule-table .day-cell { width: 120px; background: #e7efeb; color: var(--green-dark); font-weight: 750; vertical-align: middle; border-right: 3px solid #bdcec4; }
+    .schedule-period { color: var(--muted); display: block; font-size: 11px; font-weight: 500; margin-top: 5px; }
+    .schedule-card { background: #e8f2ed; border: 1px solid #d2e2d9; border-left: 4px solid var(--green); border-radius: 5px; padding: 8px; font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; box-shadow: 0 2px 5px rgba(23, 37, 34, .05); }
     .schedule-card + .schedule-card { margin-top: 5px; }
     .schedule-card strong, .schedule-card span { display: block; }
-    .schedule-card strong { color: var(--ink); font-size: 12px; margin-bottom: 3px; }
+    .schedule-card strong { color: var(--ink); font-size: 12px; margin-bottom: 4px; }
     .schedule-card span { color: #52635c; }
     .schedule-title { margin: 16px 0 0; font: 500 20px Georgia, serif; }
     .empty { padding: 38px 16px; text-align: center; color: var(--muted); border: 1px dashed #c6d4cd; }
@@ -159,7 +169,7 @@
             <select id="entitySelect"></select>
           </div>
           <form id="recordForm"><div id="recordFields" class="field-grid"></div>
-            <div class="form-actions"><span class="status" id="formStatus" role="status"></span><button class="primary" type="submit">Add record</button></div>
+            <div class="form-actions"><span class="status" id="formStatus" role="status"></span><div class="icon-actions"><button class="secondary" id="cancelEditButton" type="button" hidden>Cancel</button><button class="primary" id="submitRecordButton" type="submit">Add record</button></div></div>
           </form>
         </div>
         <div class="records">
@@ -192,7 +202,7 @@
       departments: { label: "Departments", fields: [{ name: "name", label: "Department name", type: "text" }] },
       academic_terms: { label: "Academic terms", fields: [{ name: "name", label: "Term name", type: "text" }, { name: "start_date", label: "Start date", type: "date", optional: true }, { name: "end_date", label: "End date", type: "date", optional: true }] },
       cohorts: { label: "Cohorts", fields: [{ name: "department_id", label: "Department", ref: "departments" }, { name: "academic_term_id", label: "Academic term", ref: "academic_terms" }, { name: "level", label: "Level", type: "number", min: 1 }, { name: "total_students", label: "Total students", type: "number", min: 1 }] },
-      instructors: { label: "Instructors", fields: [{ name: "name", label: "Instructor name", type: "text" }, { name: "department_id", label: "Department", ref: "departments", optional: true }, { name: "teaching_types", label: "Teaching types", type: "multi-select", options: [{ value: "lecture", label: "Lecture" }, { value: "section", label: "Section" }, { value: "lab", label: "Lab" }] }, { name: "friday_available", label: "Seconded: may teach Friday", type: "checkbox", value: false }] },
+      instructors: { label: "Instructors", fields: [{ name: "name", label: "Instructor name", type: "text" }, { name: "department_id", label: "Department", ref: "departments", optional: true }, { name: "part_time", label: "Part-time instructor", type: "checkbox", value: false }, { name: "friday_available", label: "Seconded: may teach Friday", type: "checkbox", value: false }] },
       courses: { label: "Courses", fields: [{ name: "code", label: "Course code", type: "text" }, { name: "name", label: "Course name", type: "text" }, { name: "department_id", label: "Department", ref: "departments" }] },
       rooms: { label: "Rooms", fields: [{ name: "name", label: "Room name", type: "text" }, { name: "capacity", label: "Capacity", type: "number", min: 1 }, { name: "room_type", label: "Room type", type: "select", options: [{ value: "LECTURE", label: "Lecture" }, { value: "SECTION", label: "Section" }, { value: "LAB", label: "Lab" }] }] },
       time_slots: { label: "Weekly timetable periods", fields: [{ name: "start_time", label: "Day starts", type: "time", value: "08:30" }, { name: "end_time", label: "Day ends", type: "time", value: "20:10" }] },
@@ -215,6 +225,7 @@
     const scheduleDayOrder = [6, 7, 1, 2, 3, 4, 5];
     let cachedData = {};
     let latestSchedule = null;
+    let editingOfferingId = null;
 
     function setStatus(element, message, kind = "") {
       element.textContent = message;
@@ -233,9 +244,10 @@
       if (!item) return "Unknown record";
       if (entity === "departments" || entity === "academic_terms" || entity === "rooms") return item.name;
       if (entity === "instructors") {
-        const capabilities = [...(item.teaching_types || [])];
-        if (item.friday_available) capabilities.push("Friday");
-        return `${item.name} (${capabilities.join(", ")})`;
+        const attributes = [];
+        if (item.part_time) attributes.push("Part-time");
+        if (item.friday_available) attributes.push("Seconded");
+        return attributes.length ? `${item.name} (${attributes.join(", ")})` : item.name;
       }
       if (entity === "courses") return `${item.code} · ${item.name}`;
       if (entity === "cohorts") return cohortLabel(item);
@@ -254,6 +266,7 @@
         hiddenFields.add("can_teach_section");
         hiddenFields.add("can_teach_lab");
         hiddenFields.add("teaching_types");
+        hiddenFields.add("part_time");
         hiddenFields.add("friday_available");
       }
       if (entity === "course_offerings") {
@@ -331,6 +344,70 @@
       document.getElementById("recordForm").hidden = Boolean(definition.readOnly);
       fieldHost.replaceChildren(...definition.fields.map(makeField));
     }
+    function cancelOfferingEdit() {
+      editingOfferingId = null;
+      document.getElementById("submitRecordButton").textContent = "Add record";
+      document.getElementById("cancelEditButton").hidden = true;
+      renderFields();
+    }
+    function startOfferingEdit(offering) {
+      entitySelect.value = "course_offerings";
+      editingOfferingId = offering.id;
+      renderFields();
+      entityDefinitions.course_offerings.fields.forEach((field) => {
+        const control = document.getElementById(`field-${field.name}`);
+        if (field.type === "multi-select") {
+          Array.from(control.options).forEach((option) => {
+            option.selected = offering.teaching_types.includes(option.value);
+          });
+        } else {
+          control.value = offering[field.name];
+        }
+      });
+      document.getElementById("submitRecordButton").textContent = "Save changes";
+      document.getElementById("cancelEditButton").hidden = false;
+      setStatus(document.getElementById("formStatus"), "Editing course offering.", "");
+      document.getElementById("recordForm").scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+    function invalidateSchedule(terms) {
+      if (!latestSchedule || !terms.includes(Number(latestSchedule.academic_term_id))) return;
+      latestSchedule = null;
+      document.getElementById("scheduleToolbar").hidden = true;
+      document.getElementById("scheduleTitle").hidden = true;
+      const results = document.getElementById("scheduleResults");
+      const message = document.createElement("strong");
+      message.textContent = "Timetable needs regeneration";
+      results.className = "empty";
+      results.replaceChildren(message, document.createTextNode("Course offerings changed. Generate the timetable again."));
+      setStatus(document.getElementById("generateStatus"), "Course offerings changed. Regenerate the timetable.", "");
+    }
+    async function deleteRecord(entity, row, button) {
+      const label = recordLabel(entity, row);
+      let confirmation = `Delete ${label}?`;
+      if (entity === "course_offerings") {
+        const course = getRecord("courses", row.course_id);
+        confirmation = `Delete ${course?.code || "this course"} offering? The saved timetable for this term will also be cleared and need to be generated again.`;
+      } else if (entity === "cohorts") {
+        confirmation = `Delete ${label}? Its student groups, course offerings, and saved timetable for this term will also be deleted.`;
+      }
+      if (!window.confirm(confirmation)) return;
+      button.disabled = true;
+      try {
+        const result = await api(`/api/data/${entity}/${row.id}`, { method: "DELETE" });
+        if (entity === "course_offerings" && editingOfferingId === row.id) cancelOfferingEdit();
+        await refreshData();
+        invalidateSchedule(result.timetable_invalidated_terms);
+        setStatus(
+          document.getElementById("formStatus"),
+          `${entity === "course_offerings" ? "Course offering" : label} deleted.`,
+          "success"
+        );
+      } catch (error) {
+        setStatus(document.getElementById("formStatus"), error.message, "error");
+      } finally {
+        button.disabled = false;
+      }
+    }
     function renderRecords(entity) {
       const rows = cachedData[entity] || [];
       const table = document.getElementById("recordsTable");
@@ -338,20 +415,31 @@
       document.getElementById("recordCount").textContent = `${rows.length} records`;
       if (!rows.length) { table.replaceChildren(); return; }
       const columns = getRecordColumns(entity, rows[0]);
+      const supportsDeletion = ["departments", "academic_terms", "cohorts", "instructors", "courses", "rooms", "course_offerings"].includes(entity);
       const head = document.createElement("thead");
       const headRow = document.createElement("tr");
       columns.forEach((column) => { const cell = document.createElement("th"); cell.textContent = column.label; headRow.append(cell); });
       if (entity === "cohorts") { const actionHeader = document.createElement("th"); actionHeader.textContent = "Groups"; headRow.append(actionHeader); }
       if (entity === "instructors") {
-        ["Teaching types", "Friday"].forEach((label) => {
+        ["Part-time", "Seconded / Friday"].forEach((label) => {
           const cell = document.createElement("th");
           cell.textContent = label;
           headRow.append(cell);
         });
       }
+      if (supportsDeletion) {
+        const actionHeader = document.createElement("th");
+        actionHeader.className = "row-actions";
+        actionHeader.textContent = "Actions";
+        headRow.append(actionHeader);
+      }
       head.append(headRow);
       const body = document.createElement("tbody");
-      const visibleRows = entity === "student_groups" || entity === "time_slots" ? rows : rows.slice(-8).reverse();
+      const visibleRows = entity === "student_groups" || entity === "time_slots"
+        ? rows
+        : entity === "course_offerings"
+          ? [...rows].reverse()
+          : rows.slice(-8).reverse();
       visibleRows.forEach((row) => {
         const tr = document.createElement("tr");
         columns.forEach((column) => {
@@ -380,52 +468,21 @@
           tr.append(actionCell);
         }
         if (entity === "instructors") {
-          const typesCell = document.createElement("td");
-          const typesSelect = document.createElement("select");
-          typesSelect.multiple = true;
-          typesSelect.setAttribute("aria-label", `Teaching types for ${row.name}`);
-          [
-            ["lecture", "Lecture"],
-            ["section", "Section"],
-            ["lab", "Lab"]
-          ].forEach(([value, label]) => {
-            const option = document.createElement("option");
-            option.value = value;
-            option.textContent = label;
-            option.selected = row.teaching_types.includes(value);
-            typesSelect.append(option);
-          });
-          typesSelect.addEventListener("change", async () => {
-            typesSelect.disabled = true;
-            try {
-              await api(`/api/data/instructors/${row.id}/permissions`, {
-                method: "PATCH",
-                body: JSON.stringify({ teaching_types: Array.from(typesSelect.selectedOptions, option => option.value) })
-              });
-              await refreshData();
-              setStatus(document.getElementById("formStatus"), `Teaching types updated for ${row.name}.`, "success");
-            } catch (error) {
-              Array.from(typesSelect.options).forEach(option => { option.selected = row.teaching_types.includes(option.value); });
-              setStatus(document.getElementById("formStatus"), error.message, "error");
-            } finally { typesSelect.disabled = false; }
-          });
-          typesCell.append(typesSelect);
-          tr.append(typesCell);
-          ["friday_available"].forEach((permission) => {
+          [["part_time", "Part-time"], ["friday_available", "Seconded / Friday"]].forEach(([attribute, label]) => {
             const cell = document.createElement("td");
             const checkbox = document.createElement("input");
             checkbox.type = "checkbox";
-            checkbox.checked = row[permission];
-            checkbox.setAttribute("aria-label", `${permission.replaceAll("_", " ")} for ${row.name}`);
+            checkbox.checked = row[attribute];
+            checkbox.setAttribute("aria-label", `${label} for ${row.name}`);
             checkbox.addEventListener("change", async () => {
               checkbox.disabled = true;
               try {
                 await api(`/api/data/instructors/${row.id}/permissions`, {
                   method: "PATCH",
-                  body: JSON.stringify({ [permission]: checkbox.checked })
+                  body: JSON.stringify({ [attribute]: checkbox.checked })
                 });
                 await refreshData();
-                setStatus(document.getElementById("formStatus"), `${row.name}: ${permission.replaceAll("_", " ")} updated.`, "success");
+                setStatus(document.getElementById("formStatus"), `${row.name}: ${label} updated.`, "success");
               } catch (error) {
                 checkbox.checked = !checkbox.checked;
                 setStatus(document.getElementById("formStatus"), error.message, "error");
@@ -434,6 +491,42 @@
             cell.append(checkbox);
             tr.append(cell);
           });
+        }
+        if (supportsDeletion && entity !== "course_offerings") {
+          const actionCell = document.createElement("td");
+          actionCell.className = "row-actions";
+          const deleteButton = document.createElement("button");
+          deleteButton.className = "icon-button danger";
+          deleteButton.type = "button";
+          deleteButton.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="m19 6-1 14H6L5 6"/><path d="M10 11v5M14 11v5"/></svg>';
+          deleteButton.title = `Delete ${entityDefinitions[entity].label}`;
+          deleteButton.setAttribute("aria-label", `Delete ${recordLabel(entity, row)}`);
+          deleteButton.addEventListener("click", () => deleteRecord(entity, row, deleteButton));
+          actionCell.append(deleteButton);
+          tr.append(actionCell);
+        }
+        if (entity === "course_offerings") {
+          const actionCell = document.createElement("td");
+          actionCell.className = "row-actions";
+          const actions = document.createElement("div");
+          actions.className = "icon-actions";
+          const editButton = document.createElement("button");
+          editButton.className = "icon-button";
+          editButton.type = "button";
+          editButton.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></svg>';
+          editButton.title = "Edit course offering";
+          editButton.setAttribute("aria-label", `Edit ${recordLabel("course_offerings", row)}`);
+          editButton.addEventListener("click", () => startOfferingEdit(row));
+          const deleteButton = document.createElement("button");
+          deleteButton.className = "icon-button danger";
+          deleteButton.type = "button";
+          deleteButton.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="m19 6-1 14H6L5 6"/><path d="M10 11v5M14 11v5"/></svg>';
+          deleteButton.title = "Delete course offering";
+          deleteButton.setAttribute("aria-label", `Delete ${recordLabel("course_offerings", row)}`);
+          deleteButton.addEventListener("click", () => deleteRecord("course_offerings", row, deleteButton));
+          actions.append(editButton, deleteButton);
+          actionCell.append(actions);
+          tr.append(actionCell);
         }
         body.append(tr);
       });
@@ -632,6 +725,15 @@
         context.fillText(`${formatTime(period.start_time)}–${formatTime(period.end_time)}`, x + 14, top + 49);
         context.font = "bold 19px Bahnschrift, sans-serif";
       });
+      context.strokeStyle = "#bdcec4";
+      context.lineWidth = 2;
+      for (let index = 0; index <= periods.length; index += 1) {
+        const x = left + index * columnWidth;
+        context.beginPath();
+        context.moveTo(x, top);
+        context.lineTo(x, top + 62);
+        context.stroke();
+      }
 
       const selectedSessions = selectedScheduleSessions();
       const slotsById = Object.fromEntries(cachedData.time_slots.map((slot) => [slot.id, slot]));
@@ -649,6 +751,7 @@
           context.fillStyle = day % 2 ? "#f8faf9" : "#ffffff";
           context.fillRect(x, y, columnWidth, rowHeight);
           context.strokeStyle = "#d7e0dc";
+          context.lineWidth = 1.5;
           context.strokeRect(x, y, columnWidth, rowHeight);
           const slot = cachedData.time_slots.find((item) => item.day_of_week === day && item.start_time === period.start_time);
           const sessions = slot ? selectedSessions.filter((session) => session.time_slot_id === slot.id) : [];
@@ -671,6 +774,13 @@
         });
         context.strokeStyle = "#d7e0dc";
         context.strokeRect(48, y, left - 48, rowHeight);
+        context.strokeStyle = "#bdcec4";
+        context.lineWidth = 3;
+        context.beginPath();
+        context.moveTo(48, y + rowHeight);
+        context.lineTo(left + periods.length * columnWidth, y + rowHeight);
+        context.stroke();
+        context.lineWidth = 1;
       }
       const link = document.createElement("a");
       const title = document.getElementById("scheduleTitle").textContent.replace(/[^a-z0-9_-]+/gi, "_");
@@ -686,7 +796,17 @@
       option.textContent = definition.label;
       entitySelect.append(option);
     });
-    entitySelect.addEventListener("change", () => { renderFields(); renderRecords(entitySelect.value); });
+    entitySelect.addEventListener("change", () => {
+      if (editingOfferingId !== null) {
+        editingOfferingId = null;
+        document.getElementById("submitRecordButton").textContent = "Add record";
+        document.getElementById("cancelEditButton").hidden = true;
+      }
+      setStatus(document.getElementById("formStatus"), "");
+      renderFields();
+      renderRecords(entitySelect.value);
+    });
+    document.getElementById("cancelEditButton").addEventListener("click", cancelOfferingEdit);
     scheduleMode.addEventListener("change", () => populateScheduleTargets(false));
     scheduleTarget.addEventListener("change", renderScheduleView);
     document.getElementById("downloadScheduleButton").addEventListener("click", downloadScheduleImage);
@@ -707,7 +827,19 @@
               : control.value || null;
       });
       try {
-        const result = await api(`/api/data/${entitySelect.value}`, { method: "POST", body: JSON.stringify(values) });
+        const wasEditing = editingOfferingId !== null;
+        const path = wasEditing
+          ? `/api/data/course_offerings/${editingOfferingId}`
+          : `/api/data/${entitySelect.value}`;
+        const result = await api(path, {
+          method: wasEditing ? "PATCH" : "POST",
+          body: JSON.stringify(values)
+        });
+        if (wasEditing) {
+          editingOfferingId = null;
+          document.getElementById("submitRecordButton").textContent = "Add record";
+          document.getElementById("cancelEditButton").hidden = true;
+        }
         await refreshData();
         if (entitySelect.value === "cohorts") {
           const labels = result.groups.map((group) => group.group_label).join(", ");
@@ -716,7 +848,9 @@
           setStatus(status, `Weekly schedule saved: ${result.length} periods.`, "success");
         } else if (entitySelect.value === "course_offerings") {
           const { lectures, sections, labs } = result.derived_sessions;
-          setStatus(status, `Offering saved: ${lectures} lectures, ${sections} sections, ${labs} labs per week.`, "success");
+          invalidateSchedule(result.timetable_invalidated_terms);
+          const action = wasEditing ? "updated" : "saved";
+          setStatus(status, `Offering ${action}: ${lectures} lectures, ${sections} sections, ${labs} labs per week.`, "success");
         } else {
           setStatus(status, "Record added.", "success");
         }

@@ -28,6 +28,7 @@ PERIOD_DURATION_MINUTES = 100
 BREAK_DURATION_MINUTES = 20
 FRIDAY = 5
 TEACHING_DAYS = (1, 2, 3, 4, 5, 6, 7)
+COURSE_ACTIVITY_TYPES = frozenset({"lecture", "section", "lab"})
 
 ENTITIES: dict[str, tuple[str, str, tuple[str, ...]]] = {
     "departments": ("departments", "id", ("name",)),
@@ -47,7 +48,7 @@ ENTITIES: dict[str, tuple[str, str, tuple[str, ...]]] = {
         (
             "name",
             "department_id",
-            "teaching_types",
+            "part_time",
             "friday_available",
         ),
     ),
@@ -75,6 +76,9 @@ ENTITIES: dict[str, tuple[str, str, tuple[str, ...]]] = {
         ),
     ),
 }
+DELETABLE_ENTITIES = frozenset(
+    {"departments", "academic_terms", "cohorts", "instructors", "courses", "rooms"}
+)
 
 
 def connect() -> psycopg.Connection:
@@ -87,6 +91,15 @@ def connect() -> psycopg.Connection:
         return psycopg.connect(DATABASE_URL)
     except psycopg.Error as error:
         raise HTTPException(status_code=503, detail="Could not connect to PostgreSQL.") from error
+
+
+def ensure_instructor_part_time_column(connection: psycopg.Connection) -> None:
+    connection.execute(
+        """
+        ALTER TABLE instructors
+        ADD COLUMN IF NOT EXISTS part_time BOOLEAN NOT NULL DEFAULT FALSE
+        """
+    )
 
 
 def json_value(value: Any) -> Any:
@@ -105,18 +118,6 @@ def normalize_room_type(value: str) -> str:
     return normalized
 
 
-TEACHING_CAPABILITY_FIELDS = (
-    "can_teach_lecture",
-    "can_teach_section",
-    "can_teach_lab",
-)
-TEACHING_TYPE_FIELDS = {
-    "lecture": "can_teach_lecture",
-    "section": "can_teach_section",
-    "lab": "can_teach_lab",
-}
-
-
 def normalize_teaching_types(values: Any) -> list[str]:
     if not isinstance(values, list):
         raise HTTPException(
@@ -124,20 +125,12 @@ def normalize_teaching_types(values: Any) -> list[str]:
             detail="Choose one or more teaching types.",
         )
     normalized = list(dict.fromkeys(str(value).strip().lower() for value in values))
-    if not normalized or set(normalized) - set(TEACHING_TYPE_FIELDS):
+    if not normalized or set(normalized) - COURSE_ACTIVITY_TYPES:
         raise HTTPException(
             status_code=422,
             detail="Select at least one teaching type: lecture, section, or lab.",
         )
     return normalized
-
-
-def instructor_teaching_types(values: dict[str, Any]) -> list[str]:
-    return [
-        teaching_type
-        for teaching_type, field in TEACHING_TYPE_FIELDS.items()
-        if values.get(field, False)
-    ]
 
 
 def group_label(group_number: int) -> str:
@@ -412,6 +405,8 @@ def list_entity(entity: str):
         raise HTTPException(status_code=404, detail="Unknown data type.")
     table, primary_key, _ = config
     with connect() as connection:
+        if entity == "instructors":
+            ensure_instructor_part_time_column(connection)
         rows = connection.execute(
             sql.SQL("SELECT * FROM {} ORDER BY {}").format(
                 sql.Identifier(table), sql.Identifier(primary_key)
@@ -424,9 +419,6 @@ def list_entity(entity: str):
         {key: json_value(value) for key, value in zip(columns, row)}
         for row in rows
     ]
-    if entity == "instructors":
-        for record in records:
-            record["teaching_types"] = instructor_teaching_types(record)
     if entity == "student_groups":
         for record in records:
             record["group_label"] = group_label(record["group_number"])
@@ -454,10 +446,6 @@ def create_entity(entity: str, values: dict[str, Any]):
     if entity == "course_offerings":
         return create_course_offering(values)
     values = values.copy()
-    if entity == "instructors":
-        selected_types = normalize_teaching_types(values.pop("teaching_types", None))
-        for teaching_type, field in TEACHING_TYPE_FIELDS.items():
-            values[field] = teaching_type in selected_types
     if entity == "cohorts":
         values["group_size"] = MAX_GROUP_SIZE
     if entity == "rooms" and "room_type" in values:
@@ -470,6 +458,8 @@ def create_entity(entity: str, values: dict[str, Any]):
     )
     try:
         with connect() as connection:
+            if entity == "instructors":
+                ensure_instructor_part_time_column(connection)
             cursor = connection.execute(statement, tuple(values[field] for field in fields))
             row = cursor.fetchone()
             columns = [column.name for column in cursor.description]
@@ -477,6 +467,11 @@ def create_entity(entity: str, values: dict[str, Any]):
             if entity == "cohorts":
                 cohort_id = row[columns.index("id")]
                 generated_groups = add_missing_groups(connection, cohort_id)
+    except psycopg.errors.UndefinedColumn as error:
+        raise HTTPException(
+            status_code=503,
+            detail="The database schema is outdated. Run 02_timetable_schema.sql against this database, then try again.",
+        ) from error
     except psycopg.Error as error:
         raise HTTPException(status_code=400, detail="Could not save the record; check required fields and references.") from error
     record = {key: json_value(value) for key, value in zip(columns, row)}
@@ -485,7 +480,9 @@ def create_entity(entity: str, values: dict[str, Any]):
     return record
 
 
-def create_course_offering(values: dict[str, Any]) -> dict[str, Any]:
+def prepare_course_offering(
+    connection: psycopg.Connection, values: dict[str, Any]
+) -> tuple[list[str], int, int, int]:
     required_fields = {
         "course_id",
         "cohort_id",
@@ -500,62 +497,49 @@ def create_course_offering(values: dict[str, Any]) -> dict[str, Any]:
         )
     teaching_types = normalize_teaching_types(values["teaching_types"])
 
+    cohort = connection.execute(
+        "SELECT academic_term_id FROM cohorts WHERE id = %s",
+        (values["cohort_id"],),
+    ).fetchone()
+    if cohort is None:
+        raise HTTPException(status_code=404, detail="Level not found.")
+    if cohort[0] != values["academic_term_id"]:
+        raise HTTPException(
+            status_code=422,
+            detail="The selected term does not match the selected level.",
+        )
+
+    group_count = connection.execute(
+        "SELECT count(*) FROM student_groups WHERE cohort_id = %s",
+        (values["cohort_id"],),
+    ).fetchone()[0]
+    if group_count == 0:
+        raise HTTPException(
+            status_code=422,
+            detail="Generate the level's student groups before adding its courses.",
+        )
+
+    instructor = connection.execute(
+        "SELECT id FROM instructors WHERE id = %s",
+        (values["instructor_id"],),
+    ).fetchone()
+    if instructor is None:
+        raise HTTPException(status_code=404, detail="Instructor not found.")
+
+    return (
+        teaching_types,
+        (group_count + 1) // 2 if "lecture" in teaching_types else 0,
+        group_count if "section" in teaching_types else 0,
+        group_count if "lab" in teaching_types else 0,
+    )
+
+
+def create_course_offering(values: dict[str, Any]) -> dict[str, Any]:
     try:
         with connect() as connection:
-            cohort = connection.execute(
-                "SELECT academic_term_id FROM cohorts WHERE id = %s",
-                (values["cohort_id"],),
-            ).fetchone()
-            if cohort is None:
-                raise HTTPException(status_code=404, detail="Level not found.")
-            if cohort[0] != values["academic_term_id"]:
-                raise HTTPException(
-                    status_code=422,
-                    detail="The selected term does not match the selected level.",
-                )
-
-            group_count = connection.execute(
-                "SELECT count(*) FROM student_groups WHERE cohort_id = %s",
-                (values["cohort_id"],),
-            ).fetchone()[0]
-            if group_count == 0:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Generate the level's student groups before adding its courses.",
-                )
-
-            instructor = connection.execute(
-                """
-                SELECT can_teach_lecture, can_teach_section, can_teach_lab
-                FROM instructors
-                WHERE id = %s
-                """,
-                (values["instructor_id"],),
-            ).fetchone()
-            if instructor is None:
-                raise HTTPException(status_code=404, detail="Instructor not found.")
-            unavailable_types = [
-                activity
-                for activity, enabled in zip(
-                    ("lecture", "section", "lab"), instructor
-                )
-                if activity in teaching_types and not enabled
-            ]
-            if unavailable_types:
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        "The selected instructor is not enabled for: "
-                        + ", ".join(unavailable_types)
-                        + ". Update the instructor's teaching types or choose another instructor."
-                    ),
-                )
-
-            weekly_lectures = (
-                (group_count + 1) // 2 if "lecture" in teaching_types else 0
+            teaching_types, weekly_lectures, weekly_sections, weekly_labs = (
+                prepare_course_offering(connection, values)
             )
-            weekly_sections = group_count if "section" in teaching_types else 0
-            weekly_labs = group_count if "lab" in teaching_types else 0
             cursor = connection.execute(
                 """
                 INSERT INTO course_offerings
@@ -577,6 +561,10 @@ def create_course_offering(values: dict[str, Any]) -> dict[str, Any]:
             )
             row = cursor.fetchone()
             columns = [column.name for column in cursor.description]
+            connection.execute(
+                "DELETE FROM timetable_sessions WHERE academic_term_id = %s",
+                (values["academic_term_id"],),
+            )
     except psycopg.errors.ForeignKeyViolation as error:
         raise HTTPException(
             status_code=422,
@@ -595,7 +583,146 @@ def create_course_offering(values: dict[str, Any]) -> dict[str, Any]:
         "labs": weekly_labs,
     }
     record["teaching_types"] = teaching_types
+    record["timetable_invalidated_terms"] = [values["academic_term_id"]]
     return record
+
+
+@app.patch("/api/data/course_offerings/{offering_id}")
+def update_course_offering(offering_id: int, values: dict[str, Any]) -> dict[str, Any]:
+    try:
+        with connect() as connection:
+            existing = connection.execute(
+                "SELECT academic_term_id FROM course_offerings WHERE id = %s FOR UPDATE",
+                (offering_id,),
+            ).fetchone()
+            if existing is None:
+                raise HTTPException(status_code=404, detail="Course offering not found.")
+            teaching_types, weekly_lectures, weekly_sections, weekly_labs = (
+                prepare_course_offering(connection, values)
+            )
+            affected_terms = sorted({existing[0], values["academic_term_id"]})
+            connection.execute(
+                "DELETE FROM timetable_sessions WHERE academic_term_id = ANY(%s)",
+                (affected_terms,),
+            )
+            cursor = connection.execute(
+                """
+                UPDATE course_offerings
+                SET course_id = %s, cohort_id = %s, academic_term_id = %s,
+                    instructor_id = %s, weekly_lectures = %s, weekly_sections = %s,
+                    weekly_labs = %s, has_lab = %s
+                WHERE id = %s
+                RETURNING *
+                """,
+                (
+                    values["course_id"],
+                    values["cohort_id"],
+                    values["academic_term_id"],
+                    values["instructor_id"],
+                    weekly_lectures,
+                    weekly_sections,
+                    weekly_labs,
+                    "lab" in teaching_types,
+                    offering_id,
+                ),
+            )
+            row = cursor.fetchone()
+            columns = [column.name for column in cursor.description]
+    except psycopg.errors.ForeignKeyViolation as error:
+        raise HTTPException(
+            status_code=422,
+            detail="One of the selected course, level, term, or instructor records no longer exists.",
+        ) from error
+    except psycopg.Error as error:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not update the course offering; check the selected records.",
+        ) from error
+
+    record = {key: json_value(value) for key, value in zip(columns, row)}
+    record["teaching_types"] = teaching_types
+    record["derived_sessions"] = {
+        "lectures": weekly_lectures,
+        "sections": weekly_sections,
+        "labs": weekly_labs,
+    }
+    record["timetable_invalidated_terms"] = affected_terms
+    return record
+
+
+@app.delete("/api/data/course_offerings/{offering_id}")
+def delete_course_offering(offering_id: int) -> dict[str, Any]:
+    try:
+        with connect() as connection:
+            offering = connection.execute(
+                "SELECT academic_term_id FROM course_offerings WHERE id = %s FOR UPDATE",
+                (offering_id,),
+            ).fetchone()
+            if offering is None:
+                raise HTTPException(status_code=404, detail="Course offering not found.")
+            connection.execute(
+                "DELETE FROM timetable_sessions WHERE academic_term_id = %s",
+                (offering[0],),
+            )
+            connection.execute(
+                "DELETE FROM course_offerings WHERE id = %s",
+                (offering_id,),
+            )
+    except psycopg.Error as error:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not delete the course offering.",
+        ) from error
+    return {
+        "id": offering_id,
+        "timetable_invalidated_terms": [offering[0]],
+    }
+
+
+@app.delete("/api/data/{entity}/{record_id}")
+def delete_entity(entity: str, record_id: int) -> dict[str, Any]:
+    if entity not in DELETABLE_ENTITIES:
+        raise HTTPException(status_code=404, detail="Unknown or non-deletable data type.")
+    table, primary_key, _ = ENTITIES[entity]
+    invalidated_terms: list[int] = []
+    try:
+        with connect() as connection:
+            if entity == "cohorts":
+                cohort = connection.execute(
+                    "SELECT academic_term_id FROM cohorts WHERE id = %s FOR UPDATE",
+                    (record_id,),
+                ).fetchone()
+                if cohort is None:
+                    raise HTTPException(status_code=404, detail="Cohort not found.")
+                invalidated_terms = [cohort[0]]
+                connection.execute(
+                    "DELETE FROM timetable_sessions WHERE academic_term_id = %s",
+                    (cohort[0],),
+                )
+            cursor = connection.execute(
+                sql.SQL("DELETE FROM {} WHERE {} = %s RETURNING {}").format(
+                    sql.Identifier(table),
+                    sql.Identifier(primary_key),
+                    sql.Identifier(primary_key),
+                ),
+                (record_id,),
+            )
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Record not found.")
+    except psycopg.errors.ForeignKeyViolation as error:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete this record because it is still used by other records. Delete or update those records first.",
+        ) from error
+    except psycopg.Error as error:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not delete the record.",
+        ) from error
+    return {
+        "id": record_id,
+        "timetable_invalidated_terms": invalidated_terms,
+    }
 
 
 @app.post("/api/data/cohorts/{cohort_id}/generate-groups")
@@ -613,7 +740,7 @@ class FridayAvailabilityUpdate(BaseModel):
 
 
 class InstructorPermissionsUpdate(BaseModel):
-    teaching_types: list[str] | None = None
+    part_time: bool | None = None
     friday_available: bool | None = None
 
 
@@ -623,65 +750,33 @@ def update_instructor_permissions(
 ):
     updates = update.model_dump(exclude_unset=True)
     if not updates:
-        raise HTTPException(status_code=422, detail="Choose a permission to update.")
+        raise HTTPException(status_code=422, detail="Choose an instructor attribute to update.")
+    if set(updates) - {"part_time", "friday_available"}:
+        raise HTTPException(status_code=422, detail="Invalid instructor attribute.")
     try:
         with connect() as connection:
-            current = connection.execute(
-                """
-                SELECT can_teach_lecture, can_teach_section, can_teach_lab
-                FROM instructors
-                WHERE id = %s
-                FOR UPDATE
-                """,
-                (instructor_id,),
-            ).fetchone()
-            if current is None:
-                raise HTTPException(status_code=404, detail="Instructor not found.")
-            next_capabilities = dict(zip(TEACHING_CAPABILITY_FIELDS, current))
-            if "teaching_types" in updates:
-                selected_types = normalize_teaching_types(updates.pop("teaching_types"))
-                next_capabilities.update(
-                    {
-                        field: teaching_type in selected_types
-                        for teaching_type, field in TEACHING_TYPE_FIELDS.items()
-                    }
-                )
-                updates.update(
-                    {
-                        field: teaching_type in selected_types
-                        for teaching_type, field in TEACHING_TYPE_FIELDS.items()
-                    }
-                )
-            if any(field in updates for field in TEACHING_CAPABILITY_FIELDS):
-                selected_types = instructor_teaching_types(next_capabilities)
-                if not selected_types:
-                    raise HTTPException(
-                        status_code=422,
-                        detail="Select at least one teaching type: lecture, section, or lab.",
-                    )
-
+            ensure_instructor_part_time_column(connection)
             assignments = sql.SQL(", ").join(
                 sql.SQL("{} = %s").format(sql.Identifier(field)) for field in updates
             )
             query = sql.SQL(
-                "UPDATE instructors SET {} WHERE id = %s RETURNING id, name, can_teach_lecture, can_teach_section, can_teach_lab, friday_available"
+                "UPDATE instructors SET {} WHERE id = %s RETURNING id, name, part_time, friday_available"
             ).format(assignments)
             row = connection.execute(
                 query, (*updates.values(), instructor_id)
             ).fetchone()
     except psycopg.Error as error:
         raise HTTPException(
-            status_code=503, detail="Could not update instructor permissions."
+            status_code=503, detail="Could not update instructor attributes."
         ) from error
+    if row is None:
+        raise HTTPException(status_code=404, detail="Instructor not found.")
     result = {
         "id": row[0],
         "name": row[1],
-        "can_teach_lecture": row[2],
-        "can_teach_section": row[3],
-        "can_teach_lab": row[4],
-        "friday_available": row[5],
+        "part_time": row[2],
+        "friday_available": row[3],
     }
-    result["teaching_types"] = instructor_teaching_types(result)
     return result
 
 
@@ -716,9 +811,8 @@ def generate(request: GenerateRequest):
             offerings = connection.execute(
                 """
                 SELECT co.id, co.instructor_id, i.friday_available,
-                       i.can_teach_lecture, i.can_teach_section, i.can_teach_lab,
-                      co.weekly_lectures, co.weekly_sections, co.weekly_labs,
-                      co.cohort_id
+                       co.weekly_lectures, co.weekly_sections, co.weekly_labs,
+                       co.cohort_id
                 FROM course_offerings co
                 JOIN instructors i ON i.id = co.instructor_id
                 WHERE co.academic_term_id = %s
@@ -753,7 +847,7 @@ def generate(request: GenerateRequest):
             sessions: list[Session] = []
             metadata: dict[int, tuple[int, int, str]] = {}
             next_session_id = 1
-            for offering_id, instructor_id, friday_available, can_lecture, can_section, can_lab, weekly_lectures, weekly_sections, weekly_labs, cohort_id in offerings:
+            for offering_id, instructor_id, friday_available, weekly_lectures, weekly_sections, weekly_labs, cohort_id in offerings:
                 cohort_groups = groups_by_cohort.get(cohort_id, [])
                 if not cohort_groups:
                     raise HTTPException(
@@ -773,19 +867,6 @@ def generate(request: GenerateRequest):
                     cohort_groups, teaching_types
                 )
                 for activity_type, group_ids, student_count in activity_specs:
-                    can_teach_activity = {
-                        "lecture": can_lecture,
-                        "section": can_section,
-                        "lab": can_lab,
-                    }[activity_type]
-                    if not can_teach_activity:
-                        raise HTTPException(
-                            status_code=422,
-                            detail=(
-                                f"The assigned instructor is not enabled to teach {activity_type}. "
-                                "Update the instructor's teaching permissions or assign another instructor."
-                            ),
-                        )
                     sessions.append(
                         Session(
                             next_session_id,
@@ -865,4 +946,8 @@ def generate(request: GenerateRequest):
         raise HTTPException(status_code=422, detail=str(error)) from error
     except psycopg.Error as error:
         raise HTTPException(status_code=503, detail="Database operation failed.") from error
-    return {"scheduled_sessions": len(saved), "sessions": saved}
+    return {
+        "academic_term_id": request.academic_term_id,
+        "scheduled_sessions": len(saved),
+        "sessions": saved,
+    }

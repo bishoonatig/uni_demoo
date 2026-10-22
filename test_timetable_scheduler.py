@@ -1,12 +1,19 @@
 import unittest
+from unittest.mock import patch
+
+from fastapi import HTTPException
 
 from app import (
     build_course_activity_specs,
     build_daily_periods,
     build_group_sizes,
+    delete_entity,
+    ensure_instructor_part_time_column,
     ensure_schedule_load_fits_slots,
+    ENTITIES,
     FRIDAY,
     group_label,
+    prepare_course_offering,
     TEACHING_DAYS,
     normalize_teaching_types,
 )
@@ -69,7 +76,102 @@ class GenerateScheduleTests(unittest.TestCase):
 
 
 class CohortGroupGenerationTests(unittest.TestCase):
-    def test_instructor_must_have_at_least_one_teaching_type(self):
+    def test_course_offering_values_derive_weekly_session_counts(self):
+        class FakeCursor:
+            def __init__(self, row):
+                self.row = row
+
+            def fetchone(self):
+                return self.row
+
+        class FakeConnection:
+            def execute(self, query, params):
+                if "FROM cohorts" in query:
+                    return FakeCursor((7,))
+                if "count(*)" in query:
+                    return FakeCursor((5,))
+                if "FROM instructors" in query:
+                    return FakeCursor((13,))
+                raise AssertionError(f"Unexpected query: {query}")
+
+        values = {
+            "course_id": 1,
+            "cohort_id": 2,
+            "academic_term_id": 7,
+            "instructor_id": 13,
+            "teaching_types": ["lecture", "section", "lab"],
+        }
+
+        prepared = prepare_course_offering(FakeConnection(), values)
+
+        self.assertEqual(prepared, (["lecture", "section", "lab"], 3, 5, 5))
+
+    def test_deleting_cohort_clears_term_timetable_first(self):
+        class FakeCursor:
+            def __init__(self, row):
+                self.row = row
+
+            def fetchone(self):
+                return self.row
+
+        class FakeConnection:
+            def __init__(self):
+                self.calls = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def execute(self, statement, params):
+                self.calls.append((statement, params))
+                if len(self.calls) == 1:
+                    return FakeCursor((7,))
+                if len(self.calls) == 3:
+                    return FakeCursor((12,))
+                return FakeCursor(None)
+
+        connection = FakeConnection()
+
+        with patch("app.connect", return_value=connection):
+            result = delete_entity("cohorts", 12)
+
+        self.assertEqual(result, {"id": 12, "timetable_invalidated_terms": [7]})
+        self.assertEqual(len(connection.calls), 3)
+        self.assertEqual(connection.calls[1][1], (7,))
+        self.assertEqual(connection.calls[2][1], (12,))
+
+    def test_delete_rejects_non_deletable_data_types(self):
+        with self.assertRaises(HTTPException) as context:
+            delete_entity("student_groups", 12)
+
+        self.assertEqual(context.exception.status_code, 404)
+
+    def test_part_time_schema_migration_is_additive_and_idempotent(self):
+        class RecordingConnection:
+            def __init__(self):
+                self.statements = []
+
+            def execute(self, statement):
+                self.statements.append(statement)
+
+        connection = RecordingConnection()
+
+        ensure_instructor_part_time_column(connection)
+
+        self.assertEqual(len(connection.statements), 1)
+        self.assertIn("ADD COLUMN IF NOT EXISTS part_time", connection.statements[0])
+        self.assertIn("DEFAULT FALSE", connection.statements[0])
+
+    def test_instructor_attributes_do_not_include_teaching_types(self):
+        instructor_fields = set(ENTITIES["instructors"][2])
+
+        self.assertIn("part_time", instructor_fields)
+        self.assertIn("friday_available", instructor_fields)
+        self.assertNotIn("teaching_types", instructor_fields)
+
+    def test_course_activity_teaching_types_are_validated(self):
         with self.assertRaisesRegex(Exception, "Select at least one teaching type"):
             normalize_teaching_types([])
 
