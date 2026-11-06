@@ -182,18 +182,18 @@
           <div><div class="eyebrow">Constraint solver</div><h2 id="generatorHeading">Generate timetable</h2></div>
         </div>
         <div class="generator-bar">
-          <div class="field"><label for="termSelect">Academic term</label><select id="termSelect"><option value="">Choose a term</option></select></div>
-          <button class="primary" id="generateButton" type="button">Generate schedule</button>
+          <div class="field"><label for="termSelect">View academic term</label><select id="termSelect"><option value="">Choose a term</option></select></div>
+          <button class="primary" id="generateButton" type="button">Generate all terms</button>
         </div>
-        <div class="status" id="generateStatus" role="status">Add the term data, then choose a term to schedule.</div>
+        <div class="status" id="generateStatus" role="status">Generate once to schedule all terms together and avoid instructor or room conflicts.</div>
         <div class="schedule-toolbar" id="scheduleToolbar" hidden>
-          <div class="field"><label for="scheduleMode">Schedule view</label><select id="scheduleMode"><option value="group">Student group</option><option value="instructor">Instructor</option></select></div>
+          <div class="field"><label for="scheduleMode">Schedule view</label><select id="scheduleMode"><option value="all_groups">All student groups</option><option value="group">Student group</option><option value="instructor">Instructor</option><option value="room">Room</option></select></div>
           <div class="field"><label for="scheduleTarget">Choose</label><select id="scheduleTarget"></select></div>
           <button class="secondary" id="downloadScheduleButton" type="button">Download PNG</button>
         </div>
         <h3 class="schedule-title" id="scheduleTitle" hidden></h3>
         <div id="scheduleResults" class="empty"><strong>No timetable yet</strong>Generated sessions will appear here.</div>
-        <p class="footnote">A new generation replaces the saved timetable for the selected term.</p>
+        <p class="footnote">Generating replaces all saved term schedules. Choose a term above to view its groups; instructor and room views show all terms.</p>
       </section>
     </div>
   </main>
@@ -201,20 +201,18 @@
     const entityDefinitions = {
       departments: { label: "Departments", fields: [{ name: "name", label: "Department name", type: "text" }] },
       academic_terms: { label: "Academic terms", fields: [{ name: "name", label: "Term name", type: "text" }, { name: "start_date", label: "Start date", type: "date", optional: true }, { name: "end_date", label: "End date", type: "date", optional: true }] },
-      cohorts: { label: "Cohorts", fields: [{ name: "department_id", label: "Department", ref: "departments" }, { name: "academic_term_id", label: "Academic term", ref: "academic_terms" }, { name: "level", label: "Level", type: "number", min: 1 }, { name: "total_students", label: "Total students", type: "number", min: 1 }] },
       instructors: { label: "Instructors", fields: [{ name: "name", label: "Instructor name", type: "text" }, { name: "department_id", label: "Department", ref: "departments", optional: true }, { name: "part_time", label: "Part-time instructor", type: "checkbox", value: false }, { name: "friday_available", label: "Seconded: may teach Friday", type: "checkbox", value: false }] },
       courses: { label: "Courses", fields: [{ name: "code", label: "Course code", type: "text" }, { name: "name", label: "Course name", type: "text" }, { name: "department_id", label: "Department", ref: "departments" }] },
       rooms: { label: "Rooms", fields: [{ name: "name", label: "Room name", type: "text" }, { name: "capacity", label: "Capacity", type: "number", min: 1 }, { name: "room_type", label: "Room type", type: "select", options: [{ value: "LECTURE", label: "Lecture" }, { value: "SECTION", label: "Section" }, { value: "LAB", label: "Lab" }] }] },
       time_slots: { label: "Weekly timetable periods", fields: [{ name: "start_time", label: "Day starts", type: "time", value: "08:30" }, { name: "end_time", label: "Day ends", type: "time", value: "20:10" }] },
       student_groups: { label: "Student groups", fields: [], readOnly: true },
-      course_offerings: { label: "Course offerings", fields: [{ name: "course_id", label: "Course", ref: "courses" }, { name: "cohort_id", label: "Cohort", ref: "cohorts" }, { name: "academic_term_id", label: "Academic term", ref: "academic_terms" }, { name: "instructor_id", label: "Instructor", ref: "instructors" }, { name: "teaching_types", label: "Activities for this course", type: "multi-select", options: [{ value: "lecture", label: "Lecture" }, { value: "section", label: "Section" }, { value: "lab", label: "Lab" }] }] }
+      course_offerings: { label: "Course offerings", fields: [{ name: "course_id", label: "Course", ref: "courses" }, { name: "total_students", label: "Total students in this course", type: "number", min: 1 }, { name: "academic_term_id", label: "Academic term", ref: "academic_terms" }, { name: "instructor_id", label: "Instructor", ref: "instructors" }, { name: "teaching_types", label: "Activities for this course", type: "multi-select", options: [{ value: "lecture", label: "Lecture" }, { value: "section", label: "Section" }, { value: "lab", label: "Lab" }] }] }
     };
     const referenceFields = {
-      cohorts: { department_id: ["Department", "departments"], academic_term_id: ["Term", "academic_terms"] },
       instructors: { department_id: ["Department", "departments"] },
       courses: { department_id: ["Department", "departments"] },
-      student_groups: { cohort_id: ["Level", "cohorts"] },
-      course_offerings: { course_id: ["Course", "courses"], cohort_id: ["Level", "cohorts"], academic_term_id: ["Term", "academic_terms"], instructor_id: ["Instructor", "instructors"] }
+      student_groups: { course_id: ["Course", "courses"], academic_term_id: ["Term", "academic_terms"] },
+      course_offerings: { course_id: ["Course", "courses"], academic_term_id: ["Term", "academic_terms"], instructor_id: ["Instructor", "instructors"] }
     };
     const entitySelect = document.getElementById("entitySelect");
     const fieldHost = document.getElementById("recordFields");
@@ -234,12 +232,6 @@
     function getRecord(entity, id) {
       return (cachedData[entity] || []).find((item) => String(item.id) === String(id));
     }
-    function cohortLabel(cohort) {
-      if (!cohort) return "Unknown level";
-      const department = getRecord("departments", cohort.department_id);
-      const term = getRecord("academic_terms", cohort.academic_term_id);
-      return [`Level ${cohort.level}`, department?.name, term?.name].filter(Boolean).join(" · ");
-    }
     function recordLabel(entity, item) {
       if (!item) return "Unknown record";
       if (entity === "departments" || entity === "academic_terms" || entity === "rooms") return item.name;
@@ -250,12 +242,16 @@
         return attributes.length ? `${item.name} (${attributes.join(", ")})` : item.name;
       }
       if (entity === "courses") return `${item.code} · ${item.name}`;
-      if (entity === "cohorts") return cohortLabel(item);
-      if (entity === "student_groups") return `${cohortLabel(getRecord("cohorts", item.cohort_id))} · Group ${item.group_label} (${item.student_count})`;
+      if (entity === "student_groups") {
+        const course = getRecord("courses", item.course_id);
+        const term = getRecord("academic_terms", item.academic_term_id);
+        return `${course?.code || "Course"} · ${term?.name || "Term"} · Group ${item.group_label} (${item.student_count})`;
+      }
       if (entity === "time_slots") return `${dayNames[item.day_of_week - 1]} ${formatTime(item.start_time)}–${formatTime(item.end_time)}`;
       if (entity === "course_offerings") {
         const course = getRecord("courses", item.course_id);
-        return `${recordLabel("courses", course)} · ${cohortLabel(getRecord("cohorts", item.cohort_id))}`;
+        const term = getRecord("academic_terms", item.academic_term_id);
+        return `${recordLabel("courses", course)} · ${term?.name || "Unknown term"}`;
       }
       return item.name || item.code || item.group_label || "Record";
     }
@@ -277,7 +273,14 @@
       }
       const columns = Object.keys(row)
         .filter((key) => !hiddenFields.has(key) && !key.endsWith("_id"))
-        .map((key) => ({ key, label: key === "group_label" ? "Group" : key.replaceAll("_", " ") }));
+        .map((key) => ({
+          key,
+          label: key === "group_label"
+            ? "Group"
+            : key === "total_students"
+              ? "Total students"
+              : key.replaceAll("_", " ")
+        }));
       Object.entries(referenceFields[entity] || {}).forEach(([key, [label, target]]) => {
         columns.push({ key, label, target });
       });
@@ -370,7 +373,12 @@
       document.getElementById("recordForm").scrollIntoView({ behavior: "smooth", block: "center" });
     }
     function invalidateSchedule(terms) {
-      if (!latestSchedule || !terms.includes(Number(latestSchedule.academic_term_id))) return;
+      if (
+        !latestSchedule ||
+        !latestSchedule.sessions.some((session) =>
+          terms.includes(Number(session.academic_term_id))
+        )
+      ) return;
       latestSchedule = null;
       document.getElementById("scheduleToolbar").hidden = true;
       document.getElementById("scheduleTitle").hidden = true;
@@ -387,8 +395,6 @@
       if (entity === "course_offerings") {
         const course = getRecord("courses", row.course_id);
         confirmation = `Delete ${course?.code || "this course"} offering? The saved timetable for this term will also be cleared and need to be generated again.`;
-      } else if (entity === "cohorts") {
-        confirmation = `Delete ${label}? Its student groups, course offerings, and saved timetable for this term will also be deleted.`;
       }
       if (!window.confirm(confirmation)) return;
       button.disabled = true;
@@ -415,11 +421,11 @@
       document.getElementById("recordCount").textContent = `${rows.length} records`;
       if (!rows.length) { table.replaceChildren(); return; }
       const columns = getRecordColumns(entity, rows[0]);
-      const supportsDeletion = ["departments", "academic_terms", "cohorts", "instructors", "courses", "rooms", "course_offerings"].includes(entity);
+      const supportsDeletion = ["departments", "academic_terms", "instructors", "courses", "rooms", "course_offerings"].includes(entity);
       const head = document.createElement("thead");
       const headRow = document.createElement("tr");
       columns.forEach((column) => { const cell = document.createElement("th"); cell.textContent = column.label; headRow.append(cell); });
-      if (entity === "cohorts") { const actionHeader = document.createElement("th"); actionHeader.textContent = "Groups"; headRow.append(actionHeader); }
+      if (entity === "course_offerings") { const actionHeader = document.createElement("th"); actionHeader.textContent = "Groups"; headRow.append(actionHeader); }
       if (entity === "instructors") {
         ["Part-time", "Seconded / Friday"].forEach((label) => {
           const cell = document.createElement("th");
@@ -449,7 +455,7 @@
             : displayRecordValue(entity, column.key, row[column.key]);
           tr.append(cell);
         });
-        if (entity === "cohorts") {
+        if (entity === "course_offerings") {
           const actionCell = document.createElement("td");
           const actionButton = document.createElement("button");
           actionButton.className = "secondary";
@@ -458,10 +464,11 @@
           actionButton.addEventListener("click", async () => {
             const status = document.getElementById("formStatus");
             try {
-              const result = await api(`/api/data/cohorts/${row.id}/generate-groups`, { method: "POST" });
+              const result = await api(`/api/data/course_offerings/${row.id}/generate-groups`, { method: "POST" });
               await refreshData();
               const labels = result.groups.map((group) => group.group_label).join(", ");
-              setStatus(status, result.groups.length ? `Generated groups: ${labels}.` : "All students already belong to groups.", "success");
+              invalidateSchedule(result.timetable_invalidated_terms || []);
+              setStatus(status, result.groups.length ? `Generated groups: ${labels}.` : "All course students already belong to groups.", "success");
             } catch (error) { setStatus(status, error.message, "error"); }
           });
           actionCell.append(actionButton);
@@ -533,6 +540,7 @@
       table.replaceChildren(head, body);
     }
     async function refreshData() {
+      const selectedTerm = termSelect.value;
       await Promise.all(Object.keys(entityDefinitions).map(async (entity) => {
         cachedData[entity] = await api(`/api/data/${entity}`);
       }));
@@ -546,6 +554,9 @@
         option.textContent = term.name;
         termSelect.append(option);
       });
+      if (cachedData.academic_terms.some((term) => String(term.id) === selectedTerm)) {
+        termSelect.value = selectedTerm;
+      }
     }
     function formatTime(value) {
       if (!value) return "";
@@ -555,50 +566,114 @@
     }
     function renderSchedule(result) {
       latestSchedule = result;
+      const hasSelectedTerm = result.sessions.some(
+        (session) => String(session.academic_term_id) === termSelect.value
+      );
+      if (!hasSelectedTerm && result.sessions.length) {
+        termSelect.value = String(result.sessions[0].academic_term_id);
+      }
+      latestSchedule.academic_term_id = Number(termSelect.value);
       document.getElementById("scheduleToolbar").hidden = false;
       document.getElementById("scheduleTitle").hidden = false;
       populateScheduleTargets(false);
     }
+    function termGroupTargets() {
+      const groups = (cachedData.student_groups || []).filter(
+        (group) => group.academic_term_id === latestSchedule?.academic_term_id
+      );
+      const groupsByNumber = new Map();
+      groups.forEach((group) => {
+        if (!groupsByNumber.has(group.group_number)) {
+          groupsByNumber.set(group.group_number, {
+            id: group.group_number,
+            group_number: group.group_number,
+            group_label: group.group_label
+          });
+        }
+      });
+      return [...groupsByNumber.values()].sort((a, b) => a.group_number - b.group_number);
+    }
     function populateScheduleTargets(preserveSelection = true) {
       const previous = preserveSelection ? scheduleTarget.value : "";
-      const targetEntity = scheduleMode.value === "group" ? "student_groups" : "instructors";
-      const targets = cachedData[targetEntity] || [];
+      const targetEntity = scheduleMode.value === "instructor"
+        ? "instructors"
+        : scheduleMode.value === "room"
+          ? "rooms"
+          : "student_groups";
+      const targets = scheduleMode.value === "all_groups"
+        ? [null]
+        : scheduleMode.value === "group"
+          ? termGroupTargets()
+          : (cachedData[targetEntity] || []);
       scheduleTarget.replaceChildren();
       targets.forEach((target) => {
         const option = document.createElement("option");
-        option.value = target.id;
-        option.textContent = recordLabel(targetEntity, target);
+        option.value = target ? target.id : "all";
+        option.textContent = target
+          ? scheduleMode.value === "group"
+            ? `Group ${target.group_label}`
+            : recordLabel(targetEntity, target)
+          : "All groups";
         scheduleTarget.append(option);
       });
-      if (targets.some((target) => String(target.id) === previous)) scheduleTarget.value = previous;
+      if (targets.some((target) => target && String(target.id) === previous)) scheduleTarget.value = previous;
       renderScheduleView();
     }
     function selectedScheduleSessions() {
       if (!latestSchedule || !scheduleTarget.value) return [];
+      if (scheduleMode.value === "all_groups") {
+        return latestSchedule.sessions.filter(
+          (session) => session.academic_term_id === latestSchedule.academic_term_id
+        );
+      }
       const targetId = Number(scheduleTarget.value);
       if (scheduleMode.value === "group") {
-        return latestSchedule.sessions.filter((session) => session.group_ids.includes(targetId));
+        const groupIds = new Set(
+          (cachedData.student_groups || [])
+            .filter(
+              (group) =>
+                group.academic_term_id === latestSchedule.academic_term_id &&
+                group.group_number === targetId
+            )
+            .map((group) => group.id)
+        );
+        return latestSchedule.sessions.filter(
+          (session) =>
+            session.academic_term_id === latestSchedule.academic_term_id &&
+            session.group_ids.some((groupId) => groupIds.has(groupId))
+        );
       }
       return latestSchedule.sessions.filter((session) => {
         const offering = getRecord("course_offerings", session.offering_id);
-        return offering && offering.instructor_id === targetId;
+        if (scheduleMode.value === "instructor") {
+          return offering && offering.instructor_id === targetId;
+        }
+        return scheduleMode.value === "room" && session.room_id === targetId;
       });
     }
     function renderScheduleView() {
       if (!latestSchedule) return;
       const targetId = Number(scheduleTarget.value);
-      const target = getRecord(scheduleMode.value === "group" ? "student_groups" : "instructors", targetId);
+      const target = scheduleMode.value === "all_groups"
+        ? null
+        : scheduleMode.value === "group"
+          ? termGroupTargets().find((group) => group.id === targetId)
+          : getRecord(scheduleMode.value === "room" ? "rooms" : "instructors", targetId);
       const title = document.getElementById("scheduleTitle");
-      if (!target) {
+      if (!target && scheduleMode.value !== "all_groups") {
         title.textContent = "No matching schedule";
         document.getElementById("scheduleResults").className = "empty";
         document.getElementById("scheduleResults").innerHTML = "<strong>No sessions</strong>Choose a group or instructor.";
         return;
       }
-      if (scheduleMode.value === "group") {
-        const cohort = getRecord("cohorts", target.cohort_id);
-        const department = cohort && getRecord("departments", cohort.department_id);
-        title.textContent = `Level ${cohort?.level ?? "-"} · ${department?.name || "Department"} · Group ${target.group_label}`;
+      if (scheduleMode.value === "all_groups") {
+        const term = getRecord("academic_terms", latestSchedule.academic_term_id);
+        title.textContent = `${term?.name || "Academic term"} · All student groups`;
+      } else if (scheduleMode.value === "group") {
+        const term = getRecord("academic_terms", latestSchedule.academic_term_id);
+        title.textContent = `${term?.name || "Term"} · Group ${target.group_label}`;
+      } else if (scheduleMode.value === "room") {
+        title.textContent = `${target.name} · All terms`;
       } else {
         title.textContent = target.name;
       }
@@ -652,7 +727,10 @@
             const courseName = document.createElement("strong");
             courseName.textContent = course ? `${course.code} · ${course.name}` : "Course";
             const activity = document.createElement("span");
-            activity.textContent = session.activity_type;
+            const term = getRecord("academic_terms", session.academic_term_id);
+            activity.textContent = scheduleMode.value === "instructor" || scheduleMode.value === "room"
+              ? `${session.activity_type} · ${term?.name || "Term"}`
+              : session.activity_type;
             const room = document.createElement("span");
             room.textContent = `Room: ${roomsById[session.room_id]?.name || "-"}`;
             const groupNames = document.createElement("span");
@@ -703,7 +781,17 @@
       context.fillText(document.getElementById("scheduleTitle").textContent, 48, 58);
       context.fillStyle = "#64736e";
       context.font = "18px Bahnschrift, sans-serif";
-      context.fillText(scheduleMode.value === "group" ? "Student group timetable" : "Instructor timetable", 48, 92);
+      context.fillText(
+        scheduleMode.value === "all_groups"
+          ? "All student groups timetable"
+          : scheduleMode.value === "group"
+            ? "Student group timetable"
+            : scheduleMode.value === "room"
+              ? "Room timetable across all terms"
+              : "Instructor timetable across all terms",
+        48,
+        92
+      );
 
       const left = 190;
       const top = 150;
@@ -739,8 +827,8 @@
       const slotsById = Object.fromEntries(cachedData.time_slots.map((slot) => [slot.id, slot]));
       const roomsById = Object.fromEntries(cachedData.rooms.map((room) => [room.id, room]));
       const groupsById = Object.fromEntries(cachedData.student_groups.map((group) => [group.id, group]));
-      for (const day of scheduleDayOrder) {
-        const y = top + 62 + (day - 1) * rowHeight;
+      scheduleDayOrder.forEach((day, dayIndex) => {
+        const y = top + 62 + dayIndex * rowHeight;
         context.fillStyle = day % 2 ? "#e7efeb" : "#ffffff";
         context.fillRect(48, y, left - 48, rowHeight);
         context.fillStyle = "#172522";
@@ -768,7 +856,11 @@
             drawWrappedText(context, course ? `${course.code} · ${course.name}` : "Course", x + 17, cardY + 19, columnWidth - 32, 16, 2);
             context.fillStyle = "#52635c";
             context.font = "13px Bahnschrift, sans-serif";
-            context.fillText(`${session.activity_type} · ${roomsById[session.room_id]?.name || "-"}`, x + 17, cardY + 53);
+            const term = getRecord("academic_terms", session.academic_term_id);
+            const activityLabel = scheduleMode.value === "instructor" || scheduleMode.value === "room"
+              ? `${session.activity_type} · ${term?.name || "Term"}`
+              : session.activity_type;
+            context.fillText(`${activityLabel} · ${roomsById[session.room_id]?.name || "-"}`, x + 17, cardY + 53);
             context.fillText(`Groups: ${session.group_ids.map((id) => groupsById[id]?.group_label || "?").join(" + ")}`, x + 17, cardY + 68);
           });
         });
@@ -781,7 +873,7 @@
         context.lineTo(left + periods.length * columnWidth, y + rowHeight);
         context.stroke();
         context.lineWidth = 1;
-      }
+      });
       const link = document.createElement("a");
       const title = document.getElementById("scheduleTitle").textContent.replace(/[^a-z0-9_-]+/gi, "_");
       link.download = `${title || "timetable"}.png`;
@@ -809,6 +901,11 @@
     document.getElementById("cancelEditButton").addEventListener("click", cancelOfferingEdit);
     scheduleMode.addEventListener("change", () => populateScheduleTargets(false));
     scheduleTarget.addEventListener("change", renderScheduleView);
+    termSelect.addEventListener("change", () => {
+      if (!latestSchedule) return;
+      latestSchedule.academic_term_id = Number(termSelect.value);
+      populateScheduleTargets(true);
+    });
     document.getElementById("downloadScheduleButton").addEventListener("click", downloadScheduleImage);
     document.getElementById("recordForm").addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -841,16 +938,13 @@
           document.getElementById("cancelEditButton").hidden = true;
         }
         await refreshData();
-        if (entitySelect.value === "cohorts") {
-          const labels = result.groups.map((group) => group.group_label).join(", ");
-          setStatus(status, `Cohort added: ${result.group_count} groups (${labels}).`, "success");
-        } else if (entitySelect.value === "time_slots") {
+        if (entitySelect.value === "time_slots") {
           setStatus(status, `Weekly schedule saved: ${result.length} periods.`, "success");
         } else if (entitySelect.value === "course_offerings") {
           const { lectures, sections, labs } = result.derived_sessions;
           invalidateSchedule(result.timetable_invalidated_terms);
           const action = wasEditing ? "updated" : "saved";
-          setStatus(status, `Offering ${action}: ${lectures} lectures, ${sections} sections, ${labs} labs per week.`, "success");
+          setStatus(status, `Offering ${action}: ${result.group_count} groups; ${lectures} lectures, ${sections} sections, ${labs} labs per week.`, "success");
         } else {
           setStatus(status, "Record added.", "success");
         }
@@ -858,20 +952,28 @@
     });
     document.getElementById("generateButton").addEventListener("click", async () => {
       const status = document.getElementById("generateStatus");
-      if (!termSelect.value) { setStatus(status, "Choose an academic term first.", "error"); return; }
       const button = document.getElementById("generateButton");
       button.disabled = true;
       button.textContent = "Solving…";
       try {
-        const result = await api("/api/generate", { method: "POST", body: JSON.stringify({ academic_term_id: Number(termSelect.value) }) });
+        const result = await api("/api/generate", { method: "POST" });
         renderSchedule(result);
-        setStatus(status, `${result.scheduled_sessions} sessions scheduled and saved.`, "success");
+        setStatus(status, `${result.scheduled_sessions} sessions scheduled across all terms and saved.`, "success");
       } catch (error) { setStatus(status, error.message, "error"); }
-      finally { button.disabled = false; button.textContent = "Generate schedule"; }
+      finally { button.disabled = false; button.textContent = "Generate all terms"; }
     });
     renderFields();
     api("/api/health").then(async () => {
       await refreshData();
+      const savedSchedule = await api("/api/schedule");
+      if (savedSchedule.sessions.length) {
+        renderSchedule(savedSchedule);
+        setStatus(
+          document.getElementById("generateStatus"),
+          `${savedSchedule.scheduled_sessions} saved sessions loaded. Choose a term to view its schedule.`,
+          "success"
+        );
+      }
       document.getElementById("dbSignal").classList.add("online");
       document.getElementById("dbStatus").textContent = "PostgreSQL connected";
     }).catch((error) => {

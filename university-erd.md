@@ -15,15 +15,6 @@ erDiagram
         DATE end_date
     }
 
-    cohorts {
-        BIGINT id PK
-        BIGINT department_id FK
-        BIGINT academic_term_id FK
-        SMALLINT level
-        INTEGER total_students
-        INTEGER group_size
-    }
-
     instructors {
         BIGINT id PK
         VARCHAR name
@@ -53,7 +44,8 @@ erDiagram
 
     student_groups {
         BIGINT id PK
-        BIGINT cohort_id FK
+        BIGINT course_id FK
+        BIGINT academic_term_id FK
         INTEGER group_number
         INTEGER student_count
     }
@@ -61,9 +53,9 @@ erDiagram
     course_offerings {
         BIGINT id PK
         BIGINT course_id FK
-        BIGINT cohort_id FK
         BIGINT academic_term_id FK
         BIGINT instructor_id FK
+        INTEGER total_students
         INTEGER weekly_lectures
         INTEGER weekly_sections
         INTEGER weekly_labs
@@ -86,18 +78,15 @@ erDiagram
         BIGINT group_id PK, FK
     }
 
-    departments ||--o{ cohorts : contains
     departments ||--o{ instructors : employs
     departments ||--o{ courses : offers
 
-    academic_terms ||--o{ cohorts : includes
     academic_terms ||--o{ course_offerings : includes
-
-    cohorts ||--o{ student_groups : divided_into
-    cohorts ||--o{ course_offerings : studies
 
     courses ||--o{ course_offerings : offered_as
     instructors ||--o{ course_offerings : teaches
+    courses ||--o{ student_groups : groups
+    academic_terms ||--o{ student_groups : groups_for
 
     course_offerings ||--o{ timetable_sessions : schedules
 

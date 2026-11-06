@@ -37,11 +37,6 @@ ENTITIES: dict[str, tuple[str, str, tuple[str, ...]]] = {
         "id",
         ("name", "start_date", "end_date"),
     ),
-    "cohorts": (
-        "cohorts",
-        "id",
-        ("department_id", "academic_term_id", "level", "total_students", "group_size"),
-    ),
     "instructors": (
         "instructors",
         "id",
@@ -52,7 +47,11 @@ ENTITIES: dict[str, tuple[str, str, tuple[str, ...]]] = {
             "friday_available",
         ),
     ),
-    "courses": ("courses", "id", ("code", "name", "department_id")),
+    "courses": (
+        "courses",
+        "id",
+        ("code", "name", "department_id"),
+    ),
     "rooms": ("rooms", "id", ("name", "capacity", "room_type")),
     "time_slots": (
         "time_slots",
@@ -62,22 +61,22 @@ ENTITIES: dict[str, tuple[str, str, tuple[str, ...]]] = {
     "student_groups": (
         "student_groups",
         "id",
-        ("cohort_id", "group_number", "student_count"),
+        ("course_id", "academic_term_id", "group_number", "student_count"),
     ),
     "course_offerings": (
         "course_offerings",
         "id",
         (
             "course_id",
-            "cohort_id",
             "academic_term_id",
             "instructor_id",
+            "total_students",
             "teaching_types",
         ),
     ),
 }
 DELETABLE_ENTITIES = frozenset(
-    {"departments", "academic_terms", "cohorts", "instructors", "courses", "rooms"}
+    {"departments", "academic_terms", "instructors", "courses", "rooms"}
 )
 
 
@@ -149,25 +148,36 @@ def build_group_sizes(total_students: int) -> list[int]:
 
 
 def add_missing_groups(
-    connection: psycopg.Connection, cohort_id: int
+    connection: psycopg.Connection, offering_id: int
 ) -> dict[str, Any]:
-    cohort = connection.execute(
-        "SELECT total_students FROM cohorts WHERE id = %s FOR UPDATE",
-        (cohort_id,),
+    offering = connection.execute(
+        """
+        SELECT co.course_id, co.academic_term_id, co.total_students
+        FROM course_offerings co
+        WHERE co.id = %s
+        FOR UPDATE OF co
+        """,
+        (offering_id,),
     ).fetchone()
-    if cohort is None:
-        raise HTTPException(status_code=404, detail="Cohort not found.")
+    if offering is None:
+        raise HTTPException(status_code=404, detail="Course offering not found.")
+    course_id, academic_term_id, total_students = offering
 
     existing_groups = connection.execute(
-        "SELECT group_number, student_count FROM student_groups WHERE cohort_id = %s ORDER BY group_number",
-        (cohort_id,),
+        """
+        SELECT group_number, student_count
+        FROM student_groups
+        WHERE course_id = %s AND academic_term_id = %s
+        ORDER BY group_number
+        FOR UPDATE
+        """,
+        (course_id, academic_term_id),
     ).fetchall()
     existing_total = sum(student_count for _, student_count in existing_groups)
-    total_students = cohort[0]
     if existing_total > total_students:
         raise HTTPException(
             status_code=409,
-            detail="Existing groups contain more students than the cohort total.",
+            detail="Existing course groups contain more students than the course total.",
         )
 
     first_group_number = max(
@@ -180,11 +190,12 @@ def add_missing_groups(
     ):
         group_row = connection.execute(
             """
-            INSERT INTO student_groups (cohort_id, group_number, student_count)
-            VALUES (%s, %s, %s)
+            INSERT INTO student_groups
+                (course_id, academic_term_id, group_number, student_count)
+            VALUES (%s, %s, %s, %s)
             RETURNING id
             """,
-            (cohort_id, group_number, student_count),
+            (course_id, academic_term_id, group_number, student_count),
         ).fetchone()
         generated_groups.append(
             {
@@ -201,12 +212,61 @@ def add_missing_groups(
     }
 
 
+def sync_course_groups(
+    connection: psycopg.Connection, offering_id: int
+) -> dict[str, Any]:
+    offering = connection.execute(
+        """
+        SELECT co.course_id, co.academic_term_id, co.total_students
+        FROM course_offerings co
+        WHERE co.id = %s
+        """,
+        (offering_id,),
+    ).fetchone()
+    if offering is None:
+        raise HTTPException(status_code=404, detail="Course offering not found.")
+    course_id, academic_term_id, total_students = offering
+    enrollment_totals = connection.execute(
+        """
+        SELECT MIN(total_students), MAX(total_students)
+        FROM course_offerings
+        WHERE course_id = %s AND academic_term_id = %s
+        """,
+        (course_id, academic_term_id),
+    ).fetchone()
+    if enrollment_totals[0] != enrollment_totals[1]:
+        raise HTTPException(
+            status_code=409,
+            detail="All offerings of the same course in one term must use the same student count.",
+        )
+    expected_sizes = build_group_sizes(total_students)
+    existing_groups = connection.execute(
+        """
+        SELECT student_count
+        FROM student_groups
+        WHERE course_id = %s AND academic_term_id = %s
+        ORDER BY group_number
+        """,
+        (course_id, academic_term_id),
+    ).fetchall()
+    if [student_count for (student_count,) in existing_groups] != expected_sizes:
+        connection.execute(
+            """
+            DELETE FROM student_groups
+            WHERE course_id = %s AND academic_term_id = %s
+            """,
+            (course_id, academic_term_id),
+        )
+        return add_missing_groups(connection, offering_id)
+    return {"groups": [], "group_count": len(existing_groups)}
+
+
 def build_course_activity_specs(
-    cohort_groups: list[tuple[int, int]], teaching_types: list[str]
+    offering_groups: list[tuple[int, int]], teaching_types: list[str]
 ) -> list[tuple[str, tuple[int, ...], int]]:
     group_pairs = [
-        cohort_groups[index : index + 2]
-        for index in range(0, len(cohort_groups), 2)
+        offering_groups[index : index + 2]
+        for index in range(0, len(offering_groups), 2)
     ]
     specs = []
     if "lecture" in teaching_types:
@@ -221,12 +281,12 @@ def build_course_activity_specs(
     if "section" in teaching_types:
         specs.extend(
             ("section", (group_id,), student_count)
-            for group_id, student_count in cohort_groups
+            for group_id, student_count in offering_groups
         )
     if "lab" in teaching_types:
         specs.extend(
             ("lab", (group_id,), student_count)
-            for group_id, student_count in cohort_groups
+            for group_id, student_count in offering_groups
         )
     return specs
 
@@ -433,7 +493,7 @@ def create_entity(entity: str, values: dict[str, Any]):
     if entity == "student_groups":
         raise HTTPException(
             status_code=405,
-            detail="Student groups are generated automatically from cohort totals.",
+            detail="Student groups are generated automatically from course offering totals.",
         )
     config = ENTITIES.get(entity)
     if config is None:
@@ -441,13 +501,18 @@ def create_entity(entity: str, values: dict[str, Any]):
     table, _, allowed_fields = config
     if not values or set(values) - set(allowed_fields):
         raise HTTPException(status_code=422, detail="Invalid or empty fields.")
+    if entity == "courses":
+        required_fields = {"code", "name", "department_id"}
+        if set(values) != required_fields:
+            raise HTTPException(
+                status_code=422,
+                detail="Enter the course code, name, and department.",
+            )
     if entity == "time_slots":
         return replace_weekly_time_slots(values)
     if entity == "course_offerings":
         return create_course_offering(values)
     values = values.copy()
-    if entity == "cohorts":
-        values["group_size"] = MAX_GROUP_SIZE
     if entity == "rooms" and "room_type" in values:
         values["room_type"] = normalize_room_type(values["room_type"])
     fields = tuple(values)
@@ -463,10 +528,6 @@ def create_entity(entity: str, values: dict[str, Any]):
             cursor = connection.execute(statement, tuple(values[field] for field in fields))
             row = cursor.fetchone()
             columns = [column.name for column in cursor.description]
-            generated_groups = None
-            if entity == "cohorts":
-                cohort_id = row[columns.index("id")]
-                generated_groups = add_missing_groups(connection, cohort_id)
     except psycopg.errors.UndefinedColumn as error:
         raise HTTPException(
             status_code=503,
@@ -475,48 +536,68 @@ def create_entity(entity: str, values: dict[str, Any]):
     except psycopg.Error as error:
         raise HTTPException(status_code=400, detail="Could not save the record; check required fields and references.") from error
     record = {key: json_value(value) for key, value in zip(columns, row)}
-    if generated_groups is not None:
-        record.update(generated_groups)
     return record
 
 
 def prepare_course_offering(
-    connection: psycopg.Connection, values: dict[str, Any]
-) -> tuple[list[str], int, int, int]:
+    connection: psycopg.Connection,
+    values: dict[str, Any],
+    offering_id: int | None = None,
+) -> tuple[list[str], int, int, int, int]:
     required_fields = {
         "course_id",
-        "cohort_id",
         "academic_term_id",
         "instructor_id",
+        "total_students",
         "teaching_types",
     }
     if set(values) != required_fields:
         raise HTTPException(
             status_code=422,
-            detail="Choose a course, level, term, instructor, and one or more teaching types.",
+            detail="Choose a course, term, instructor, enter total students, and select one or more teaching types.",
+        )
+    total_students = values["total_students"]
+    if (
+        isinstance(total_students, bool)
+        or not isinstance(total_students, int)
+        or total_students < 1
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Course offering total students must be a positive integer.",
         )
     teaching_types = normalize_teaching_types(values["teaching_types"])
-
-    cohort = connection.execute(
-        "SELECT academic_term_id FROM cohorts WHERE id = %s",
-        (values["cohort_id"],),
+    course = connection.execute(
+        "SELECT id FROM courses WHERE id = %s",
+        (values["course_id"],),
     ).fetchone()
-    if cohort is None:
-        raise HTTPException(status_code=404, detail="Level not found.")
-    if cohort[0] != values["academic_term_id"]:
-        raise HTTPException(
-            status_code=422,
-            detail="The selected term does not match the selected level.",
-        )
+    if course is None:
+        raise HTTPException(status_code=404, detail="Course not found.")
 
-    group_count = connection.execute(
-        "SELECT count(*) FROM student_groups WHERE cohort_id = %s",
-        (values["cohort_id"],),
+    group_count = len(build_group_sizes(total_students))
+    enrollment_query = """
+        SELECT EXISTS (
+            SELECT 1
+            FROM course_offerings
+            WHERE course_id = %s AND academic_term_id = %s
+              AND total_students <> %s
+    """
+    enrollment_params: tuple[Any, ...] = (
+        values["course_id"],
+        values["academic_term_id"],
+        total_students,
+    )
+    if offering_id is not None:
+        enrollment_query += " AND id <> %s"
+        enrollment_params += (offering_id,)
+    enrollment_query += ")"
+    enrollment_conflict = connection.execute(
+        enrollment_query, enrollment_params
     ).fetchone()[0]
-    if group_count == 0:
+    if enrollment_conflict:
         raise HTTPException(
-            status_code=422,
-            detail="Generate the level's student groups before adding its courses.",
+            status_code=409,
+            detail="This course already has a different student count in the selected term.",
         )
 
     instructor = connection.execute(
@@ -528,6 +609,7 @@ def prepare_course_offering(
 
     return (
         teaching_types,
+        total_students,
         (group_count + 1) // 2 if "lecture" in teaching_types else 0,
         group_count if "section" in teaching_types else 0,
         group_count if "lab" in teaching_types else 0,
@@ -537,22 +619,27 @@ def prepare_course_offering(
 def create_course_offering(values: dict[str, Any]) -> dict[str, Any]:
     try:
         with connect() as connection:
-            teaching_types, weekly_lectures, weekly_sections, weekly_labs = (
-                prepare_course_offering(connection, values)
-            )
+            (
+                teaching_types,
+                total_students,
+                weekly_lectures,
+                weekly_sections,
+                weekly_labs,
+            ) = prepare_course_offering(connection, values)
             cursor = connection.execute(
                 """
                 INSERT INTO course_offerings
-                    (course_id, cohort_id, academic_term_id, instructor_id,
-                     weekly_lectures, weekly_sections, weekly_labs, has_lab)
+                    (course_id, academic_term_id, instructor_id,
+                     total_students, weekly_lectures, weekly_sections, weekly_labs,
+                     has_lab)
                  VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING *
                 """,
                 (
                     values["course_id"],
-                    values["cohort_id"],
                     values["academic_term_id"],
                     values["instructor_id"],
+                    total_students,
                     weekly_lectures,
                     weekly_sections,
                     weekly_labs,
@@ -561,6 +648,9 @@ def create_course_offering(values: dict[str, Any]) -> dict[str, Any]:
             )
             row = cursor.fetchone()
             columns = [column.name for column in cursor.description]
+            generated_groups = sync_course_groups(
+                connection, row[columns.index("id")]
+            )
             connection.execute(
                 "DELETE FROM timetable_sessions WHERE academic_term_id = %s",
                 (values["academic_term_id"],),
@@ -568,7 +658,7 @@ def create_course_offering(values: dict[str, Any]) -> dict[str, Any]:
     except psycopg.errors.ForeignKeyViolation as error:
         raise HTTPException(
             status_code=422,
-            detail="One of the selected course, level, term, or instructor records no longer exists.",
+            detail="One of the selected course, term, or instructor records no longer exists.",
         ) from error
     except psycopg.Error as error:
         raise HTTPException(
@@ -582,6 +672,7 @@ def create_course_offering(values: dict[str, Any]) -> dict[str, Any]:
         "sections": weekly_sections,
         "labs": weekly_labs,
     }
+    record.update(generated_groups)
     record["teaching_types"] = teaching_types
     record["timetable_invalidated_terms"] = [values["academic_term_id"]]
     return record
@@ -592,14 +683,18 @@ def update_course_offering(offering_id: int, values: dict[str, Any]) -> dict[str
     try:
         with connect() as connection:
             existing = connection.execute(
-                "SELECT academic_term_id FROM course_offerings WHERE id = %s FOR UPDATE",
+                "SELECT academic_term_id, course_id FROM course_offerings WHERE id = %s FOR UPDATE",
                 (offering_id,),
             ).fetchone()
             if existing is None:
                 raise HTTPException(status_code=404, detail="Course offering not found.")
-            teaching_types, weekly_lectures, weekly_sections, weekly_labs = (
-                prepare_course_offering(connection, values)
-            )
+            (
+                teaching_types,
+                total_students,
+                weekly_lectures,
+                weekly_sections,
+                weekly_labs,
+            ) = prepare_course_offering(connection, values, offering_id)
             affected_terms = sorted({existing[0], values["academic_term_id"]})
             connection.execute(
                 "DELETE FROM timetable_sessions WHERE academic_term_id = ANY(%s)",
@@ -608,17 +703,17 @@ def update_course_offering(offering_id: int, values: dict[str, Any]) -> dict[str
             cursor = connection.execute(
                 """
                 UPDATE course_offerings
-                SET course_id = %s, cohort_id = %s, academic_term_id = %s,
-                    instructor_id = %s, weekly_lectures = %s, weekly_sections = %s,
-                    weekly_labs = %s, has_lab = %s
+                SET course_id = %s, academic_term_id = %s,
+                    instructor_id = %s, total_students = %s, weekly_lectures = %s,
+                    weekly_sections = %s, weekly_labs = %s, has_lab = %s
                 WHERE id = %s
                 RETURNING *
                 """,
                 (
                     values["course_id"],
-                    values["cohort_id"],
                     values["academic_term_id"],
                     values["instructor_id"],
+                    total_students,
                     weekly_lectures,
                     weekly_sections,
                     weekly_labs,
@@ -628,10 +723,33 @@ def update_course_offering(offering_id: int, values: dict[str, Any]) -> dict[str
             )
             row = cursor.fetchone()
             columns = [column.name for column in cursor.description]
+            generated_groups = sync_course_groups(connection, offering_id)
+            if (
+                existing[0] != values["academic_term_id"]
+                or existing[1] != values["course_id"]
+            ):
+                remaining_offerings = connection.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM course_offerings
+                        WHERE course_id = %s AND academic_term_id = %s
+                    )
+                    """,
+                    (existing[1], existing[0]),
+                ).fetchone()[0]
+                if not remaining_offerings:
+                    connection.execute(
+                        """
+                        DELETE FROM student_groups
+                        WHERE course_id = %s AND academic_term_id = %s
+                        """,
+                        (existing[1], existing[0]),
+                    )
     except psycopg.errors.ForeignKeyViolation as error:
         raise HTTPException(
             status_code=422,
-            detail="One of the selected course, level, term, or instructor records no longer exists.",
+            detail="One of the selected course, term, or instructor records no longer exists.",
         ) from error
     except psycopg.Error as error:
         raise HTTPException(
@@ -646,6 +764,7 @@ def update_course_offering(offering_id: int, values: dict[str, Any]) -> dict[str
         "sections": weekly_sections,
         "labs": weekly_labs,
     }
+    record.update(generated_groups)
     record["timetable_invalidated_terms"] = affected_terms
     return record
 
@@ -655,7 +774,7 @@ def delete_course_offering(offering_id: int) -> dict[str, Any]:
     try:
         with connect() as connection:
             offering = connection.execute(
-                "SELECT academic_term_id FROM course_offerings WHERE id = %s FOR UPDATE",
+                "SELECT academic_term_id, course_id FROM course_offerings WHERE id = %s FOR UPDATE",
                 (offering_id,),
             ).fetchone()
             if offering is None:
@@ -668,6 +787,23 @@ def delete_course_offering(offering_id: int) -> dict[str, Any]:
                 "DELETE FROM course_offerings WHERE id = %s",
                 (offering_id,),
             )
+            has_remaining_offerings = connection.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM course_offerings
+                    WHERE course_id = %s AND academic_term_id = %s
+                )
+                """,
+                (offering[1], offering[0]),
+            ).fetchone()[0]
+            if not has_remaining_offerings:
+                connection.execute(
+                    """
+                    DELETE FROM student_groups
+                    WHERE course_id = %s AND academic_term_id = %s
+                    """,
+                    (offering[1], offering[0]),
+                )
     except psycopg.Error as error:
         raise HTTPException(
             status_code=400,
@@ -687,18 +823,6 @@ def delete_entity(entity: str, record_id: int) -> dict[str, Any]:
     invalidated_terms: list[int] = []
     try:
         with connect() as connection:
-            if entity == "cohorts":
-                cohort = connection.execute(
-                    "SELECT academic_term_id FROM cohorts WHERE id = %s FOR UPDATE",
-                    (record_id,),
-                ).fetchone()
-                if cohort is None:
-                    raise HTTPException(status_code=404, detail="Cohort not found.")
-                invalidated_terms = [cohort[0]]
-                connection.execute(
-                    "DELETE FROM timetable_sessions WHERE academic_term_id = %s",
-                    (cohort[0],),
-                )
             cursor = connection.execute(
                 sql.SQL("DELETE FROM {} WHERE {} = %s RETURNING {}").format(
                     sql.Identifier(table),
@@ -725,14 +849,21 @@ def delete_entity(entity: str, record_id: int) -> dict[str, Any]:
     }
 
 
-@app.post("/api/data/cohorts/{cohort_id}/generate-groups")
-def generate_missing_cohort_groups(cohort_id: int):
+@app.post("/api/data/course_offerings/{offering_id}/generate-groups")
+def generate_missing_offering_groups(offering_id: int):
     with connect() as connection:
-        return add_missing_groups(connection, cohort_id)
-
-
-class GenerateRequest(BaseModel):
-    academic_term_id: int
+        result = sync_course_groups(connection, offering_id)
+        if result["groups"]:
+            term_id = connection.execute(
+                "SELECT academic_term_id FROM course_offerings WHERE id = %s",
+                (offering_id,),
+            ).fetchone()[0]
+            connection.execute(
+                "DELETE FROM timetable_sessions WHERE academic_term_id = %s",
+                (term_id,),
+            )
+            result["timetable_invalidated_terms"] = [term_id]
+        return result
 
 
 class FridayAvailabilityUpdate(BaseModel):
@@ -804,34 +935,75 @@ def update_friday_availability(
     return {"id": row[0], "name": row[1], "friday_available": row[2]}
 
 
+def load_saved_schedule_sessions(connection: psycopg.Connection) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT ts.id, ts.offering_id, ts.academic_term_id,
+               ts.activity_type, ts.session_number, ts.room_id,
+               ts.time_slot_id,
+               COALESCE(
+                   array_agg(sg.group_id ORDER BY sg.group_id)
+                       FILTER (WHERE sg.group_id IS NOT NULL),
+                   ARRAY[]::BIGINT[]
+               ) AS group_ids
+        FROM timetable_sessions ts
+        LEFT JOIN session_groups sg ON sg.session_id = ts.id
+        GROUP BY ts.id
+        ORDER BY ts.academic_term_id, ts.id
+        """
+    ).fetchall()
+    return [
+        {
+            "session_id": row[0],
+            "offering_id": row[1],
+            "academic_term_id": row[2],
+            "activity_type": row[3].lower(),
+            "session_number": row[4],
+            "room_id": row[5],
+            "time_slot_id": row[6],
+            "group_ids": row[7],
+        }
+        for row in rows
+    ]
+
+
+@app.get("/api/schedule")
+def get_saved_schedule() -> dict[str, Any]:
+    try:
+        with connect() as connection:
+            sessions = load_saved_schedule_sessions(connection)
+    except psycopg.Error as error:
+        raise HTTPException(
+            status_code=503, detail="Could not load the saved timetable."
+        ) from error
+    return {"scheduled_sessions": len(sessions), "sessions": sessions}
+
+
 @app.post("/api/generate")
-def generate(request: GenerateRequest):
+def generate():
     try:
         with connect() as connection:
             offerings = connection.execute(
                 """
                 SELECT co.id, co.instructor_id, i.friday_available,
                        co.weekly_lectures, co.weekly_sections, co.weekly_labs,
-                       co.cohort_id
+                       co.course_id, co.academic_term_id
                 FROM course_offerings co
                 JOIN instructors i ON i.id = co.instructor_id
-                WHERE co.academic_term_id = %s
                 ORDER BY co.id
                 """,
-                (request.academic_term_id,),
             ).fetchall()
-            groups_by_cohort: dict[int, list[tuple[int, int]]] = {}
-            for cohort_id, group_id, student_count in connection.execute(
+            groups_by_course_term: dict[tuple[int, int], list[tuple[int, int]]] = {}
+            for course_id, academic_term_id, group_id, student_count in connection.execute(
                 """
-                SELECT c.id, sg.id, sg.student_count
-                FROM cohorts c
-                JOIN student_groups sg ON sg.cohort_id = c.id
-                WHERE c.academic_term_id = %s
+                SELECT sg.course_id, sg.academic_term_id, sg.id, sg.student_count
+                FROM student_groups sg
                 ORDER BY sg.id
                 """,
-                (request.academic_term_id,),
             ).fetchall():
-                groups_by_cohort.setdefault(cohort_id, []).append((group_id, student_count))
+                groups_by_course_term.setdefault(
+                    (course_id, academic_term_id), []
+                ).append((group_id, student_count))
             room_rows = connection.execute(
                 "SELECT id, capacity, room_type FROM rooms ORDER BY id"
             ).fetchall()
@@ -843,16 +1015,18 @@ def generate(request: GenerateRequest):
                 FROM time_slots ORDER BY day_of_week, start_time
                 """
             ).fetchall()
-
             sessions: list[Session] = []
-            metadata: dict[int, tuple[int, int, str]] = {}
+            metadata: dict[int, tuple[int, int, int, str]] = {}
+            session_numbers: dict[tuple[int, str], int] = {}
             next_session_id = 1
-            for offering_id, instructor_id, friday_available, weekly_lectures, weekly_sections, weekly_labs, cohort_id in offerings:
-                cohort_groups = groups_by_cohort.get(cohort_id, [])
-                if not cohort_groups:
+            for offering_id, instructor_id, friday_available, weekly_lectures, weekly_sections, weekly_labs, course_id, academic_term_id in offerings:
+                course_groups = groups_by_course_term.get(
+                    (course_id, academic_term_id), []
+                )
+                if not course_groups:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"Cohort {cohort_id} needs student groups before its timetable can be generated.",
+                        detail=f"Course offering {offering_id} in term {academic_term_id} needs student groups before the timetable can be generated.",
                     )
                 teaching_types = [
                     activity
@@ -864,9 +1038,11 @@ def generate(request: GenerateRequest):
                     if weekly_count > 0
                 ]
                 activity_specs = build_course_activity_specs(
-                    cohort_groups, teaching_types
+                    course_groups, teaching_types
                 )
                 for activity_type, group_ids, student_count in activity_specs:
+                    session_key = (offering_id, activity_type)
+                    session_numbers[session_key] = session_numbers.get(session_key, 0) + 1
                     sessions.append(
                         Session(
                             next_session_id,
@@ -877,11 +1053,19 @@ def generate(request: GenerateRequest):
                             friday_available,
                         )
                     )
-                    metadata[next_session_id] = (offering_id, len([key for key, value in metadata.items() if value[0] == offering_id and value[2] == activity_type]) + 1, activity_type)
+                    metadata[next_session_id] = (
+                        offering_id,
+                        academic_term_id,
+                        session_numbers[session_key],
+                        activity_type,
+                    )
                     next_session_id += 1
 
             if not sessions:
-                raise HTTPException(status_code=400, detail="No course offerings with weekly sessions were found for this term.")
+                raise HTTPException(
+                    status_code=400,
+                    detail="No course offerings with weekly sessions were found.",
+                )
 
             time_slots = [TimeSlot(*row) for row in slot_rows]
             ensure_schedule_load_fits_slots(sessions, time_slots)
@@ -891,13 +1075,14 @@ def generate(request: GenerateRequest):
                 time_slots,
             )
 
-            connection.execute(
-                "DELETE FROM timetable_sessions WHERE academic_term_id = %s",
-                (request.academic_term_id,),
-            )
-            saved = []
+            connection.execute("DELETE FROM timetable_sessions")
             for assignment in assignments:
-                offering_id, session_number, activity_type = metadata[assignment.session_id]
+                (
+                    offering_id,
+                    academic_term_id,
+                    session_number,
+                    activity_type,
+                ) = metadata[assignment.session_id]
                 instructor_id = next(
                     session.instructor_id
                     for session in sessions
@@ -912,7 +1097,7 @@ def generate(request: GenerateRequest):
                     """,
                     (
                         offering_id,
-                        request.academic_term_id,
+                        academic_term_id,
                         instructor_id,
                         assignment.room_id,
                         assignment.time_slot_id,
@@ -931,23 +1116,12 @@ def generate(request: GenerateRequest):
                         "INSERT INTO session_groups (session_id, time_slot_id, group_id) VALUES (%s, %s, %s)",
                         (session_id, assignment.time_slot_id, group_id),
                     )
-                saved.append(
-                    {
-                        "session_id": session_id,
-                        "offering_id": offering_id,
-                        "activity_type": activity_type,
-                        "session_number": session_number,
-                        "room_id": assignment.room_id,
-                        "time_slot_id": assignment.time_slot_id,
-                        "group_ids": list(group_ids),
-                    }
-                )
+            schedule_sessions = load_saved_schedule_sessions(connection)
     except ScheduleInfeasibleError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     except psycopg.Error as error:
         raise HTTPException(status_code=503, detail="Database operation failed.") from error
     return {
-        "academic_term_id": request.academic_term_id,
-        "scheduled_sessions": len(saved),
-        "sessions": saved,
+        "scheduled_sessions": len(schedule_sessions),
+        "sessions": schedule_sessions,
     }
