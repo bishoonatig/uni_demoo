@@ -35,28 +35,17 @@ class Assignment:
     time_slot_id: int
 
 
-@dataclass(frozen=True)
-class ReservedAssignment:
-    instructor_id: int
-    room_id: int
-    time_slot_id: int
-
-
 class ScheduleInfeasibleError(ValueError):
     pass
 
 
 def generate_schedule(
-    sessions: list[Session],
-    rooms: list[Room],
-    time_slots: list[TimeSlot],
-    reserved_assignments: list[ReservedAssignment] | None = None,
+    sessions: list[Session], rooms: list[Room], time_slots: list[TimeSlot]
 ) -> list[Assignment]:
     """Assign each session a compatible room and time without resource conflicts."""
     if not sessions:
         return []
 
-    reserved_assignments = reserved_assignments or []
     model = cp_model.CpModel()
     options: dict[tuple[int, int, int], cp_model.IntVar] = {}
     session_options: dict[int, list[cp_model.IntVar]] = {
@@ -112,31 +101,9 @@ def generate_schedule(
             )
         model.AddExactlyOne(session_options[session.session_id])
 
-    slot_by_id = {slot.time_slot_id: slot for slot in time_slots}
-    for session in sessions:
-        for key, variable in options.items():
-            if key[0] != session.session_id:
-                continue
-            candidate_slot = slot_by_id[key[2]]
-            for reserved in reserved_assignments:
-                reserved_slot = slot_by_id.get(reserved.time_slot_id)
-                if reserved_slot is None:
-                    continue
-                overlaps = (
-                    candidate_slot.day_of_week == reserved_slot.day_of_week
-                    and candidate_slot.start_minute < reserved_slot.end_minute
-                    and reserved_slot.start_minute < candidate_slot.end_minute
-                )
-                if not overlaps:
-                    continue
-                if (
-                    session.instructor_id == reserved.instructor_id
-                    or key[1] == reserved.room_id
-                ):
-                    model.Add(variable == 0)
-
     objective_terms: list[cp_model.LinearExpr] = []
     session_by_id = {session.session_id: session for session in sessions}
+    slot_by_id = {slot.time_slot_id: slot for slot in time_slots}
     slot_order = {
         slot.time_slot_id: index
         for day in {slot.day_of_week for slot in time_slots}
