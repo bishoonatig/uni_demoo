@@ -1,27 +1,50 @@
+from __future__ import annotations
+
 import os
+from contextlib import asynccontextmanager, contextmanager
 from datetime import date, datetime, time, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any, Iterator
 
 import psycopg
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from psycopg import sql
+from psycopg_pool import ConnectionPool, PoolTimeout
 from pydantic import BaseModel
 
-from timetable_scheduler import (
-    Room,
-    ScheduleInfeasibleError,
-    Session,
-    TimeSlot,
-    generate_schedule,
-)
+if TYPE_CHECKING:
+    from timetable_scheduler import Room, ScheduleInfeasibleError, Session, TimeSlot
 
 
 load_dotenv()
 
-app = FastAPI(title="University Timetable Generator")
 DATABASE_URL = os.getenv("DATABASE_URL")
+connection_pool = (
+    ConnectionPool(
+        conninfo=DATABASE_URL,
+        min_size=0,
+        max_size=10,
+        timeout=10,
+        open=False,
+    )
+    if DATABASE_URL
+    else None
+)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    if connection_pool is not None:
+        connection_pool.open()
+    try:
+        yield
+    finally:
+        if connection_pool is not None:
+            connection_pool.close()
+
+
+app = FastAPI(title="University Timetable Generator", lifespan=lifespan)
 MAX_GROUP_SIZE = 20
 PERIODS_PER_DAY = 6
 PERIOD_DURATION_MINUTES = 100
@@ -80,25 +103,18 @@ DELETABLE_ENTITIES = frozenset(
 )
 
 
-def connect() -> psycopg.Connection:
-    if not DATABASE_URL:
+@contextmanager
+def connect() -> Iterator[psycopg.Connection]:
+    if connection_pool is None:
         raise HTTPException(
             status_code=503,
             detail="Set DATABASE_URL to connect the app to PostgreSQL.",
         )
     try:
-        return psycopg.connect(DATABASE_URL)
-    except psycopg.Error as error:
+        with connection_pool.connection() as connection:
+            yield connection
+    except PoolTimeout as error:
         raise HTTPException(status_code=503, detail="Could not connect to PostgreSQL.") from error
-
-
-def ensure_instructor_part_time_column(connection: psycopg.Connection) -> None:
-    connection.execute(
-        """
-        ALTER TABLE instructors
-        ADD COLUMN IF NOT EXISTS part_time BOOLEAN NOT NULL DEFAULT FALSE
-        """
-    )
 
 
 def json_value(value: Any) -> Any:
@@ -183,28 +199,33 @@ def add_missing_groups(
     first_group_number = max(
         (group_number for group_number, _ in existing_groups), default=0
     ) + 1
-    generated_groups = []
-    for group_number, student_count in enumerate(
-        build_group_sizes(total_students - existing_total),
-        start=first_group_number,
-    ):
-        group_row = connection.execute(
+    group_sizes = build_group_sizes(total_students - existing_total)
+    if group_sizes:
+        group_rows = connection.execute(
             """
             INSERT INTO student_groups
                 (course_id, academic_term_id, group_number, student_count)
-            VALUES (%s, %s, %s, %s)
-            RETURNING id
+            SELECT %s, %s, %s + group_data.ordinality::integer - 1,
+                   group_data.student_count
+            FROM unnest(%s::integer[]) WITH ORDINALITY
+                AS group_data(student_count, ordinality)
+            RETURNING id, group_number, student_count
             """,
-            (course_id, academic_term_id, group_number, student_count),
-        ).fetchone()
-        generated_groups.append(
-            {
-                "id": group_row[0],
-                "group_number": group_number,
-                "group_label": group_label(group_number),
-                "student_count": student_count,
-            }
+            (course_id, academic_term_id, first_group_number, group_sizes),
+        ).fetchall()
+    else:
+        group_rows = []
+    generated_groups = [
+        {
+            "id": group_id,
+            "group_number": group_number,
+            "group_label": group_label(group_number),
+            "student_count": student_count,
+        }
+        for group_id, group_number, student_count in sorted(
+            group_rows, key=lambda group: group[1]
         )
+    ]
 
     return {
         "groups": generated_groups,
@@ -389,25 +410,31 @@ def replace_weekly_time_slots(values: dict[str, Any]) -> list[dict[str, Any]]:
                     )
                 connection.execute("DELETE FROM time_slots")
 
-            created = []
-            for day in TEACHING_DAYS:
-                for start, end in periods:
-                    slot_id = connection.execute(
-                        """
-                        INSERT INTO time_slots (day_of_week, start_time, end_time)
-                        VALUES (%s, %s, %s)
-                        RETURNING id
-                        """,
-                        (day, start, end),
-                    ).fetchone()[0]
-                    created.append(
-                        {
-                            "id": slot_id,
-                            "day_of_week": day,
-                            "start_time": start.isoformat(),
-                            "end_time": end.isoformat(),
-                        }
-                    )
+            slot_rows = connection.execute(
+                """
+                INSERT INTO time_slots (day_of_week, start_time, end_time)
+                SELECT slot_data.day_of_week, slot_data.start_time, slot_data.end_time
+                FROM unnest(%s::smallint[], %s::time[], %s::time[])
+                    AS slot_data(day_of_week, start_time, end_time)
+                RETURNING id, day_of_week, start_time, end_time
+                """,
+                (
+                    [day for day in TEACHING_DAYS for _ in periods],
+                    [start for _ in TEACHING_DAYS for start, _ in periods],
+                    [end for _ in TEACHING_DAYS for _, end in periods],
+                ),
+            ).fetchall()
+            created = [
+                {
+                    "id": slot_id,
+                    "day_of_week": day,
+                    "start_time": start.isoformat(),
+                    "end_time": end.isoformat(),
+                }
+                for slot_id, day, start, end in sorted(
+                    slot_rows, key=lambda slot: (slot[1], slot[2])
+                )
+            ]
             return created
     except psycopg.Error as error:
         raise HTTPException(
@@ -465,16 +492,13 @@ def list_entity(entity: str):
         raise HTTPException(status_code=404, detail="Unknown data type.")
     table, primary_key, _ = config
     with connect() as connection:
-        if entity == "instructors":
-            ensure_instructor_part_time_column(connection)
-        rows = connection.execute(
+        cursor = connection.execute(
             sql.SQL("SELECT * FROM {} ORDER BY {}").format(
                 sql.Identifier(table), sql.Identifier(primary_key)
             )
-        ).fetchall()
-        columns = [column.name for column in connection.execute(
-            sql.SQL("SELECT * FROM {} LIMIT 0").format(sql.Identifier(table))
-        ).description]
+        )
+        rows = cursor.fetchall()
+        columns = [column.name for column in cursor.description]
     records = [
         {key: json_value(value) for key, value in zip(columns, row)}
         for row in rows
@@ -523,8 +547,6 @@ def create_entity(entity: str, values: dict[str, Any]):
     )
     try:
         with connect() as connection:
-            if entity == "instructors":
-                ensure_instructor_part_time_column(connection)
             cursor = connection.execute(statement, tuple(values[field] for field in fields))
             row = cursor.fetchone()
             columns = [column.name for column in cursor.description]
@@ -875,6 +897,18 @@ class InstructorPermissionsUpdate(BaseModel):
     friday_available: bool | None = None
 
 
+class ScheduleSessionUpdate(BaseModel):
+    room_id: int
+    time_slot_id: int
+
+
+class ScheduleSessionSwap(BaseModel):
+    first_session_id: int
+    second_session_id: int
+    swap_time: bool = True
+    swap_room: bool = True
+
+
 @app.patch("/api/data/instructors/{instructor_id}/permissions")
 def update_instructor_permissions(
     instructor_id: int, update: InstructorPermissionsUpdate
@@ -886,7 +920,6 @@ def update_instructor_permissions(
         raise HTTPException(status_code=422, detail="Invalid instructor attribute.")
     try:
         with connect() as connection:
-            ensure_instructor_part_time_column(connection)
             assignments = sql.SQL(", ").join(
                 sql.SQL("{} = %s").format(sql.Identifier(field)) for field in updates
             )
@@ -979,8 +1012,466 @@ def get_saved_schedule() -> dict[str, Any]:
     return {"scheduled_sessions": len(sessions), "sessions": sessions}
 
 
+@app.patch("/api/schedule/sessions/{session_id}")
+def update_schedule_session(
+    session_id: int, update: ScheduleSessionUpdate
+) -> dict[str, Any]:
+    try:
+        with connect() as connection:
+            session = connection.execute(
+                """
+                SELECT ts.instructor_id, ts.activity_type,
+                       co.total_students, i.friday_available
+                FROM timetable_sessions ts
+                JOIN course_offerings co ON co.id = ts.offering_id
+                JOIN instructors i ON i.id = ts.instructor_id
+                WHERE ts.id = %s
+                FOR UPDATE OF ts
+                """,
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                raise HTTPException(status_code=404, detail="Scheduled session not found.")
+            instructor_id, activity_type, student_count, friday_available = session
+            session_group_count = connection.execute(
+                """
+                SELECT SUM(sg.student_count)
+                FROM session_groups session_group
+                JOIN student_groups sg ON sg.id = session_group.group_id
+                WHERE session_group.session_id = %s
+                """,
+                (session_id,),
+            ).fetchone()[0]
+            if session_group_count is not None:
+                student_count = session_group_count
+
+            slot = connection.execute(
+                "SELECT day_of_week FROM time_slots WHERE id = %s",
+                (update.time_slot_id,),
+            ).fetchone()
+            if slot is None:
+                raise HTTPException(status_code=404, detail="Time period not found.")
+            if slot[0] == FRIDAY and not friday_available:
+                raise HTTPException(
+                    status_code=422,
+                    detail="This instructor is not available on Friday.",
+                )
+
+            room = connection.execute(
+                "SELECT capacity, room_type FROM rooms WHERE id = %s",
+                (update.room_id,),
+            ).fetchone()
+            if room is None:
+                raise HTTPException(status_code=404, detail="Room not found.")
+            room_capacity, room_type = room
+            if room_capacity < student_count:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"The selected room must fit all {student_count} students.",
+                )
+            if room_type.casefold() != activity_type.casefold():
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"This session requires a {activity_type.lower()} room.",
+                )
+
+            has_conflict = connection.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM timetable_sessions other
+                    JOIN time_slots other_slot ON other_slot.id = other.time_slot_id
+                    JOIN time_slots target_slot ON target_slot.id = %s
+                    WHERE other.id <> %s
+                      AND other_slot.day_of_week = target_slot.day_of_week
+                      AND target_slot.start_time < other_slot.end_time
+                      AND other_slot.start_time < target_slot.end_time
+                      AND (
+                          other.room_id = %s
+                          OR other.instructor_id = %s
+                          OR EXISTS (
+                              SELECT 1
+                              FROM session_groups current_group
+                              JOIN session_groups other_group
+                                  ON other_group.group_id = current_group.group_id
+                              WHERE current_group.session_id = %s
+                                AND other_group.session_id = other.id
+                          )
+                      )
+                )
+                """,
+                (
+                    update.time_slot_id,
+                    session_id,
+                    update.room_id,
+                    instructor_id,
+                    session_id,
+                ),
+            ).fetchone()[0]
+            if has_conflict:
+                raise HTTPException(
+                    status_code=409,
+                    detail="That period conflicts with this room, instructor, or student group.",
+                )
+
+            group_ids = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT group_id FROM session_groups WHERE session_id = %s",
+                    (session_id,),
+                ).fetchall()
+            ]
+            connection.execute(
+                "DELETE FROM session_groups WHERE session_id = %s",
+                (session_id,),
+            )
+            connection.execute(
+                """
+                UPDATE timetable_sessions
+                SET room_id = %s, time_slot_id = %s
+                WHERE id = %s
+                """,
+                (update.room_id, update.time_slot_id, session_id),
+            )
+            connection.cursor().executemany(
+                """
+                INSERT INTO session_groups (session_id, time_slot_id, group_id)
+                VALUES (%s, %s, %s)
+                """,
+                [
+                    (session_id, update.time_slot_id, group_id)
+                    for group_id in group_ids
+                ],
+            )
+            updated_session = next(
+                item
+                for item in load_saved_schedule_sessions(connection)
+                if item["session_id"] == session_id
+            )
+    except psycopg.Error as error:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Could not update the scheduled session: "
+                f"{error.diag.message_primary or 'database error'}"
+            ),
+        ) from error
+    return updated_session
+
+
+@app.delete("/api/schedule/sessions/{session_id}")
+def delete_schedule_session(session_id: int) -> dict[str, int]:
+    try:
+        with connect() as connection:
+            deleted = connection.execute(
+                "DELETE FROM timetable_sessions WHERE id = %s RETURNING id",
+                (session_id,),
+            ).fetchone()
+            if deleted is None:
+                raise HTTPException(status_code=404, detail="Scheduled session not found.")
+    except psycopg.Error as error:
+        raise HTTPException(
+            status_code=503, detail="Could not delete the scheduled session."
+        ) from error
+    return {"id": session_id}
+
+
+@app.post("/api/schedule/sessions/swap")
+def swap_schedule_sessions(update: ScheduleSessionSwap) -> dict[str, Any]:
+    if update.first_session_id == update.second_session_id:
+        raise HTTPException(status_code=422, detail="Choose two different sessions.")
+    if not update.swap_time and not update.swap_room:
+        raise HTTPException(
+            status_code=422, detail="Choose whether to swap the time, the room, or both."
+        )
+
+    session_ids = [update.first_session_id, update.second_session_id]
+    try:
+        with connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT ts.id, ts.instructor_id, ts.activity_type,
+                       co.total_students, i.friday_available,
+                       ts.room_id, ts.time_slot_id, ts.academic_term_id
+                FROM timetable_sessions ts
+                JOIN course_offerings co ON co.id = ts.offering_id
+                JOIN instructors i ON i.id = ts.instructor_id
+                WHERE ts.id = ANY(%s)
+                ORDER BY ts.id
+                FOR UPDATE OF ts
+                """,
+                (session_ids,),
+            ).fetchall()
+            if len(rows) != 2:
+                raise HTTPException(status_code=404, detail="One or both sessions were not found.")
+
+            sessions = {
+                row[0]: {
+                    "id": row[0],
+                    "instructor_id": row[1],
+                    "activity_type": row[2],
+                    "student_count": row[3],
+                    "friday_available": row[4],
+                    "room_id": row[5],
+                    "time_slot_id": row[6],
+                    "academic_term_id": row[7],
+                }
+                for row in rows
+            }
+            group_rows = connection.execute(
+                """
+                SELECT sg.session_id, sg.group_id, student_group.student_count
+                FROM session_groups sg
+                JOIN student_groups student_group ON student_group.id = sg.group_id
+                WHERE sg.session_id = ANY(%s)
+                """,
+                (session_ids,),
+            ).fetchall()
+            group_ids = {session_id: [] for session_id in session_ids}
+            group_student_counts: dict[int, int] = {}
+            for session_id, group_id, student_count in group_rows:
+                group_ids[session_id].append(group_id)
+                group_student_counts[group_id] = student_count
+            for session_id in session_ids:
+                if group_ids[session_id]:
+                    sessions[session_id]["student_count"] = sum(
+                        group_student_counts[group_id]
+                        for group_id in group_ids[session_id]
+                    )
+
+            first = sessions[update.first_session_id]
+            second = sessions[update.second_session_id]
+            proposed = {
+                first["id"]: {
+                    "room_id": second["room_id"] if update.swap_room else first["room_id"],
+                    "time_slot_id": second["time_slot_id"] if update.swap_time else first["time_slot_id"],
+                },
+                second["id"]: {
+                    "room_id": first["room_id"] if update.swap_room else second["room_id"],
+                    "time_slot_id": first["time_slot_id"] if update.swap_time else second["time_slot_id"],
+                },
+            }
+            slots = {
+                row[0]: row[1]
+                for row in connection.execute(
+                    """
+                    SELECT id, day_of_week
+                    FROM time_slots
+                    WHERE id = ANY(%s)
+                    """,
+                    ([item["time_slot_id"] for item in proposed.values()],),
+                ).fetchall()
+            }
+            if any(
+                assignment["time_slot_id"] not in slots
+                for assignment in proposed.values()
+            ):
+                raise HTTPException(status_code=404, detail="A session time period was not found.")
+
+            for session_id in session_ids:
+                session = sessions[session_id]
+                assignment = proposed[session_id]
+                if slots[assignment["time_slot_id"]] == FRIDAY and not session["friday_available"]:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="One of the instructors is not available on Friday.",
+                    )
+                room = connection.execute(
+                    "SELECT capacity, room_type FROM rooms WHERE id = %s",
+                    (assignment["room_id"],),
+                ).fetchone()
+                if room is None:
+                    raise HTTPException(status_code=404, detail="A session room was not found.")
+                if room[0] < session["student_count"]:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"The selected room must fit all {session['student_count']} students.",
+                    )
+                if room[1].casefold() != session["activity_type"].casefold():
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Each session must stay in a {session['activity_type'].lower()} room.",
+                    )
+
+                has_conflict = connection.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM timetable_sessions other
+                        JOIN time_slots other_slot ON other_slot.id = other.time_slot_id
+                        JOIN time_slots target_slot ON target_slot.id = %s
+                        WHERE NOT (other.id = ANY(%s))
+                          AND other_slot.day_of_week = target_slot.day_of_week
+                          AND target_slot.start_time < other_slot.end_time
+                          AND other_slot.start_time < target_slot.end_time
+                          AND (
+                              other.room_id = %s
+                              OR other.instructor_id = %s
+                              OR EXISTS (
+                                  SELECT 1
+                                  FROM session_groups current_group
+                                  JOIN session_groups other_group
+                                      ON other_group.group_id = current_group.group_id
+                                  WHERE current_group.session_id = %s
+                                    AND other_group.session_id = other.id
+                              )
+                          )
+                    )
+                    """,
+                    (
+                        assignment["time_slot_id"],
+                        session_ids,
+                        assignment["room_id"],
+                        session["instructor_id"],
+                        session_id,
+                    ),
+                ).fetchone()[0]
+                if has_conflict:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="The swap conflicts with another room, instructor, or student group.",
+                    )
+
+            first_slot = connection.execute(
+                """
+                SELECT day_of_week, start_time, end_time
+                FROM time_slots WHERE id = %s
+                """,
+                (proposed[first["id"]]["time_slot_id"],),
+            ).fetchone()
+            second_slot = connection.execute(
+                """
+                SELECT day_of_week, start_time, end_time
+                FROM time_slots WHERE id = %s
+                """,
+                (proposed[second["id"]]["time_slot_id"],),
+            ).fetchone()
+            overlap = (
+                first_slot[0] == second_slot[0]
+                and first_slot[1] < second_slot[2]
+                and second_slot[1] < first_slot[2]
+            )
+            shared_group = bool(set(group_ids[first["id"]]) & set(group_ids[second["id"]]))
+            same_resource = (
+                proposed[first["id"]]["room_id"] == proposed[second["id"]]["room_id"]
+                or first["instructor_id"] == second["instructor_id"]
+                or shared_group
+            )
+            if overlap and same_resource:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The swapped sessions would conflict with each other.",
+                )
+
+            connection.execute(
+                "DELETE FROM session_groups WHERE session_id = ANY(%s)",
+                (session_ids,),
+            )
+            cursor = connection.cursor()
+            if update.swap_time:
+                temporary_slots: dict[int, int] = {}
+                for session_id in session_ids:
+                    session = sessions[session_id]
+                    excluded_temporary_slots = {
+                        temporary_slot
+                        for other_id, temporary_slot in temporary_slots.items()
+                        if (
+                            sessions[other_id]["academic_term_id"]
+                            == session["academic_term_id"]
+                            and sessions[other_id]["instructor_id"]
+                            == session["instructor_id"]
+                        )
+                    }
+                    temporary_slot = connection.execute(
+                        """
+                        SELECT slot.id
+                        FROM time_slots slot
+                        WHERE NOT (slot.id = ANY(%s))
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM timetable_sessions occupied
+                              WHERE occupied.id <> ALL(%s)
+                                AND occupied.academic_term_id = %s
+                                AND occupied.instructor_id = %s
+                                AND occupied.time_slot_id = slot.id
+                          )
+                        ORDER BY slot.id
+                        LIMIT 1
+                        """,
+                        (
+                            list(excluded_temporary_slots),
+                            session_ids,
+                            session["academic_term_id"],
+                            session["instructor_id"],
+                        ),
+                    ).fetchone()
+                    if temporary_slot is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "There is no free temporary period to safely swap these "
+                                "sessions. Move one session to a free period first."
+                            ),
+                        )
+                    temporary_slots[session_id] = temporary_slot[0]
+
+                for session_id in session_ids:
+                    cursor.execute(
+                        "UPDATE timetable_sessions SET time_slot_id = %s WHERE id = %s",
+                        (temporary_slots[session_id], session_id),
+                    )
+
+            for session_id in session_ids:
+                assignment = proposed[session_id]
+                cursor.execute(
+                    """
+                    UPDATE timetable_sessions
+                    SET room_id = %s, time_slot_id = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        assignment["room_id"],
+                        assignment["time_slot_id"] if update.swap_time else sessions[session_id]["time_slot_id"],
+                        session_id,
+                    ),
+                )
+                cursor.executemany(
+                    """
+                    INSERT INTO session_groups (session_id, time_slot_id, group_id)
+                    VALUES (%s, %s, %s)
+                    """,
+                    [
+                        (session_id, assignment["time_slot_id"], group_id)
+                        for group_id in group_ids[session_id]
+                    ],
+                )
+
+            updated_sessions = [
+                item
+                for item in load_saved_schedule_sessions(connection)
+                if item["session_id"] in session_ids
+            ]
+    except psycopg.Error as error:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Could not swap the scheduled sessions: "
+                f"{error.diag.message_primary or 'database error'}"
+            ),
+        ) from error
+    return {"sessions": updated_sessions}
+
+
 @app.post("/api/generate")
 def generate():
+    from timetable_scheduler import (
+        Room,
+        ScheduleInfeasibleError,
+        Session,
+        TimeSlot,
+        generate_schedule,
+    )
+
     try:
         with connect() as connection:
             offerings = connection.execute(

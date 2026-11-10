@@ -118,10 +118,21 @@
     .schedule-table .day-cell { width: 120px; background: #e7efeb; color: var(--green-dark); font-weight: 750; vertical-align: middle; border-right: 3px solid #bdcec4; }
     .schedule-period { color: var(--muted); display: block; font-size: 11px; font-weight: 500; margin-top: 5px; }
     .schedule-card { background: #e8f2ed; border: 1px solid #d2e2d9; border-left: 4px solid var(--green); border-radius: 5px; padding: 8px; font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; box-shadow: 0 2px 5px rgba(23, 37, 34, .05); }
+    .schedule-card.swap-selected { outline: 2px solid var(--green); }
     .schedule-card + .schedule-card { margin-top: 5px; }
     .schedule-card strong, .schedule-card span { display: block; }
     .schedule-card strong { color: var(--ink); font-size: 12px; margin-bottom: 4px; }
     .schedule-card span { color: #52635c; }
+    .schedule-card-actions { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+    .schedule-card-actions button { min-height: 28px; padding: 4px 8px; font-size: 10px; }
+    .schedule-edit { display: grid; gap: 6px; margin-top: 7px; }
+    .schedule-edit label { display: grid; gap: 3px; font-size: 10px; }
+    .schedule-edit select { min-height: 32px; padding: 5px; font-size: 10px; }
+    .schedule-swap-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; margin-top: 12px; }
+    .schedule-swap-controls[hidden] { display: none; }
+    .schedule-swap-fields { display: flex; gap: 12px; align-items: center; }
+    .schedule-swap-fields label { display: inline-flex; align-items: center; gap: 5px; }
+    .schedule-swap-fields input { width: auto; min-height: 0; accent-color: var(--green); }
     .schedule-title { margin: 16px 0 0; font: 500 20px Georgia, serif; }
     .empty { padding: 38px 16px; text-align: center; color: var(--muted); border: 1px dashed #c6d4cd; }
     .empty strong { display: block; color: var(--ink); font: 500 18px Georgia, serif; margin-bottom: 7px; }
@@ -191,9 +202,18 @@
           <div class="field"><label for="scheduleTarget">Choose</label><select id="scheduleTarget"></select></div>
           <button class="secondary" id="downloadScheduleButton" type="button">Download PNG</button>
         </div>
+        <div class="schedule-swap-controls" id="scheduleSwapControls" hidden>
+          <span id="scheduleSwapSelection" class="status"></span>
+          <div class="schedule-swap-fields">
+            <label><input id="swapTimeCheckbox" type="checkbox" checked> Day/time</label>
+            <label><input id="swapRoomCheckbox" type="checkbox" checked> Room</label>
+          </div>
+          <button class="primary" id="swapSessionsButton" type="button">Swap sessions</button>
+          <button class="secondary" id="cancelSwapButton" type="button">Cancel</button>
+        </div>
         <h3 class="schedule-title" id="scheduleTitle" hidden></h3>
         <div id="scheduleResults" class="empty"><strong>No timetable yet</strong>Generated sessions will appear here.</div>
-        <p class="footnote">Generating replaces all saved term schedules. Choose a term above to view its groups; instructor and room views show all terms.</p>
+        <p class="footnote">You can edit or remove individual sessions from the timetable. Changes are saved automatically; generating again replaces all manual timetable changes.</p>
       </section>
     </div>
   </main>
@@ -224,6 +244,7 @@
     let cachedData = {};
     let latestSchedule = null;
     let editingOfferingId = null;
+    let scheduleSwapSelection = [];
 
     function setStatus(element, message, kind = "") {
       element.textContent = message;
@@ -296,8 +317,18 @@
     }
     async function api(path, options = {}) {
       const response = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
-      const body = await response.json();
-      if (!response.ok) throw new Error(body.detail || "Request failed.");
+      const responseText = await response.text();
+      let body;
+      try {
+        body = responseText ? JSON.parse(responseText) : {};
+      } catch {
+        throw new Error(
+          response.ok
+            ? "The server returned an invalid response."
+            : `Server error (${response.status} ${response.statusText}).`
+        );
+      }
+      if (!response.ok) throw new Error(body.detail || `Request failed (${response.status}).`);
       return body;
     }
     function makeField(field) {
@@ -401,7 +432,15 @@
       try {
         const result = await api(`/api/data/${entity}/${row.id}`, { method: "DELETE" });
         if (entity === "course_offerings" && editingOfferingId === row.id) cancelOfferingEdit();
-        await refreshData();
+        cachedData[entity] = cachedData[entity].filter((record) => record.id !== row.id);
+        if (entity === "course_offerings") {
+          await refreshData(["student_groups"]);
+        } else if (entity === "academic_terms") {
+          await refreshData(["academic_terms"]);
+        } else {
+          renderFields();
+          renderRecords(entitySelect.value);
+        }
         invalidateSchedule(result.timetable_invalidated_terms);
         setStatus(
           document.getElementById("formStatus"),
@@ -463,7 +502,7 @@
             const status = document.getElementById("formStatus");
             try {
               const result = await api(`/api/data/course_offerings/${row.id}/generate-groups`, { method: "POST" });
-              await refreshData();
+              await refreshData(["student_groups"]);
               const labels = result.groups.map((group) => group.group_label).join(", ");
               invalidateSchedule(result.timetable_invalidated_terms || []);
               setStatus(status, result.groups.length ? `Generated groups: ${labels}.` : "All course students already belong to groups.", "success");
@@ -486,7 +525,7 @@
                   method: "PATCH",
                   body: JSON.stringify({ [attribute]: checkbox.checked })
                 });
-                await refreshData();
+                await refreshData(["instructors"]);
                 setStatus(document.getElementById("formStatus"), `${row.name}: ${label} updated.`, "success");
               } catch (error) {
                 checkbox.checked = !checkbox.checked;
@@ -537,9 +576,9 @@
       });
       table.replaceChildren(head, body);
     }
-    async function refreshData() {
+    async function refreshData(entities = Object.keys(entityDefinitions)) {
       const selectedTerm = termSelect.value;
-      await Promise.all(Object.keys(entityDefinitions).map(async (entity) => {
+      await Promise.all(entities.map(async (entity) => {
         cachedData[entity] = await api(`/api/data/${entity}`);
       }));
       const current = entitySelect.value;
@@ -564,6 +603,7 @@
     }
     function renderSchedule(result) {
       latestSchedule = result;
+      scheduleSwapSelection = [];
       const hasSelectedTerm = result.sessions.some(
         (session) => String(session.academic_term_id) === termSelect.value
       );
@@ -573,6 +613,7 @@
       latestSchedule.academic_term_id = Number(termSelect.value);
       document.getElementById("scheduleToolbar").hidden = false;
       document.getElementById("scheduleTitle").hidden = false;
+      updateScheduleSwapControls();
       populateScheduleTargets(false);
     }
     function termGroupTargets() {
@@ -648,6 +689,158 @@
         }
         return scheduleMode.value === "room" && session.room_id === targetId;
       });
+    }
+    function scheduleSessionLabel(session) {
+      const offering = getRecord("course_offerings", session.offering_id);
+      const course = offering && getRecord("courses", offering.course_id);
+      return `${course?.code || "Course"} · ${session.activity_type}`;
+    }
+    function updateScheduleSwapControls() {
+      const controls = document.getElementById("scheduleSwapControls");
+      controls.hidden = scheduleSwapSelection.length === 0;
+      const selected = scheduleSwapSelection
+        .map((sessionId) => latestSchedule?.sessions.find((session) => session.session_id === sessionId))
+        .filter(Boolean);
+      document.getElementById("scheduleSwapSelection").textContent = selected.length
+        ? `Selected: ${selected.map(scheduleSessionLabel).join(" ↔ ")}`
+        : "";
+      document.getElementById("swapSessionsButton").disabled =
+        selected.length !== 2 ||
+        (!document.getElementById("swapTimeCheckbox").checked &&
+          !document.getElementById("swapRoomCheckbox").checked);
+    }
+    async function swapSelectedScheduleSessions() {
+      if (scheduleSwapSelection.length !== 2) return;
+      const button = document.getElementById("swapSessionsButton");
+      button.disabled = true;
+      try {
+        const result = await api("/api/schedule/sessions/swap", {
+          method: "POST",
+          body: JSON.stringify({
+            first_session_id: scheduleSwapSelection[0],
+            second_session_id: scheduleSwapSelection[1],
+            swap_time: document.getElementById("swapTimeCheckbox").checked,
+            swap_room: document.getElementById("swapRoomCheckbox").checked
+          })
+        });
+        result.sessions.forEach((updated) => {
+          const index = latestSchedule.sessions.findIndex(
+            (session) => session.session_id === updated.session_id
+          );
+          if (index !== -1) latestSchedule.sessions[index] = updated;
+        });
+        scheduleSwapSelection = [];
+        setStatus(document.getElementById("generateStatus"), "Sessions swapped and saved.", "success");
+        updateScheduleSwapControls();
+        renderScheduleView();
+      } catch (error) {
+        setStatus(document.getElementById("generateStatus"), error.message, "error");
+        updateScheduleSwapControls();
+      }
+    }
+    function startScheduleSessionEdit(session, card) {
+      card.replaceChildren();
+      const form = document.createElement("form");
+      form.className = "schedule-edit";
+
+      const periodLabel = document.createElement("label");
+      periodLabel.textContent = "Day and time";
+      const periodSelect = document.createElement("select");
+      periodSelect.required = true;
+      const dayOrder = new Map(
+        scheduleDayOrder.map((day, index) => [day, index])
+      );
+      [...cachedData.time_slots]
+        .sort((a, b) =>
+          dayOrder.get(a.day_of_week) - dayOrder.get(b.day_of_week) ||
+          a.start_time.localeCompare(b.start_time)
+        )
+        .forEach((slot) => {
+          const option = document.createElement("option");
+          option.value = slot.id;
+          option.textContent = `${dayNames[slot.day_of_week - 1]} ${formatTime(slot.start_time)}–${formatTime(slot.end_time)}`;
+          option.selected = slot.id === session.time_slot_id;
+          periodSelect.append(option);
+        });
+      periodLabel.append(periodSelect);
+
+      const roomLabel = document.createElement("label");
+      roomLabel.textContent = "Room";
+      const roomSelect = document.createElement("select");
+      roomSelect.required = true;
+      const sessionStudentCount = session.group_ids.reduce(
+        (total, groupId) =>
+          total + (cachedData.student_groups.find((group) => group.id === groupId)?.student_count || 0),
+        0
+      ) || getRecord("course_offerings", session.offering_id)?.total_students || 0;
+      cachedData.rooms
+        .filter((room) =>
+          room.capacity >= sessionStudentCount &&
+          room.room_type.toLowerCase() === session.activity_type.toLowerCase()
+        )
+        .forEach((room) => {
+          const option = document.createElement("option");
+          option.value = room.id;
+          option.textContent = `${room.name} · ${room.capacity} · ${room.room_type}`;
+          option.selected = room.id === session.room_id;
+          roomSelect.append(option);
+        });
+      roomLabel.append(roomSelect);
+
+      const actions = document.createElement("div");
+      actions.className = "schedule-card-actions";
+      const saveButton = document.createElement("button");
+      saveButton.className = "primary";
+      saveButton.type = "submit";
+      saveButton.textContent = "Save";
+      const cancelButton = document.createElement("button");
+      cancelButton.className = "secondary";
+      cancelButton.type = "button";
+      cancelButton.textContent = "Cancel";
+      cancelButton.addEventListener("click", renderScheduleView);
+      actions.append(saveButton, cancelButton);
+      form.append(periodLabel, roomLabel, actions);
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        saveButton.disabled = true;
+        try {
+          const updated = await api(`/api/schedule/sessions/${session.session_id}`, {
+            method: "PATCH",
+            body: JSON.stringify({
+              time_slot_id: Number(periodSelect.value),
+              room_id: Number(roomSelect.value)
+            })
+          });
+          const index = latestSchedule.sessions.findIndex(
+            (item) => item.session_id === updated.session_id
+          );
+          latestSchedule.sessions[index] = updated;
+          setStatus(document.getElementById("generateStatus"), "Timetable session updated.", "success");
+          renderScheduleView();
+        } catch (error) {
+          setStatus(document.getElementById("generateStatus"), error.message, "error");
+          saveButton.disabled = false;
+        }
+      });
+      card.append(form);
+    }
+    async function deleteScheduleSession(session) {
+      if (!window.confirm("Remove this session from the saved timetable? Generating again will restore it.")) return;
+      try {
+        await api(`/api/schedule/sessions/${session.session_id}`, { method: "DELETE" });
+        latestSchedule.sessions = latestSchedule.sessions.filter(
+          (item) => item.session_id !== session.session_id
+        );
+        scheduleSwapSelection = scheduleSwapSelection.filter(
+          (sessionId) => sessionId !== session.session_id
+        );
+        latestSchedule.scheduled_sessions = latestSchedule.sessions.length;
+        updateScheduleSwapControls();
+        setStatus(document.getElementById("generateStatus"), "Session removed from the saved timetable.", "success");
+        renderScheduleView();
+      } catch (error) {
+        setStatus(document.getElementById("generateStatus"), error.message, "error");
+      }
     }
     function renderScheduleView() {
       if (!latestSchedule) return;
@@ -733,7 +926,43 @@
             room.textContent = `Room: ${roomsById[session.room_id]?.name || "-"}`;
             const groupNames = document.createElement("span");
             groupNames.textContent = `Groups: ${session.group_ids.map((id) => groupsById[id]?.group_label || "?").join(" + ")}`;
-            card.append(courseName, activity, room, groupNames);
+            const actions = document.createElement("div");
+            actions.className = "schedule-card-actions";
+            if (scheduleSwapSelection.includes(session.session_id)) {
+              card.classList.add("swap-selected");
+            }
+            const editButton = document.createElement("button");
+            editButton.className = "secondary";
+            editButton.type = "button";
+            editButton.textContent = "Edit";
+            editButton.addEventListener("click", () => startScheduleSessionEdit(session, card));
+            const deleteButton = document.createElement("button");
+            deleteButton.className = "secondary";
+            deleteButton.type = "button";
+            deleteButton.textContent = "Remove";
+            deleteButton.addEventListener("click", () => deleteScheduleSession(session));
+            const swapButton = document.createElement("button");
+            swapButton.className = "secondary";
+            swapButton.type = "button";
+            swapButton.textContent = scheduleSwapSelection.includes(session.session_id)
+              ? "Selected"
+              : "Select to swap";
+            swapButton.disabled =
+              scheduleSwapSelection.length === 2 &&
+              !scheduleSwapSelection.includes(session.session_id);
+            swapButton.addEventListener("click", () => {
+              if (!scheduleSwapSelection.includes(session.session_id)) {
+                scheduleSwapSelection.push(session.session_id);
+              } else {
+                scheduleSwapSelection = scheduleSwapSelection.filter(
+                  (sessionId) => sessionId !== session.session_id
+                );
+              }
+              updateScheduleSwapControls();
+              renderScheduleView();
+            });
+            actions.append(editButton, deleteButton, swapButton);
+            card.append(courseName, activity, room, groupNames, actions);
             cell.append(card);
           });
           row.append(cell);
@@ -899,6 +1128,14 @@
     document.getElementById("cancelEditButton").addEventListener("click", cancelOfferingEdit);
     scheduleMode.addEventListener("change", () => populateScheduleTargets(false));
     scheduleTarget.addEventListener("change", renderScheduleView);
+    document.getElementById("swapTimeCheckbox").addEventListener("change", updateScheduleSwapControls);
+    document.getElementById("swapRoomCheckbox").addEventListener("change", updateScheduleSwapControls);
+    document.getElementById("swapSessionsButton").addEventListener("click", swapSelectedScheduleSessions);
+    document.getElementById("cancelSwapButton").addEventListener("click", () => {
+      scheduleSwapSelection = [];
+      updateScheduleSwapControls();
+      renderScheduleView();
+    });
     termSelect.addEventListener("change", () => {
       if (!latestSchedule) return;
       latestSchedule.academic_term_id = Number(termSelect.value);
@@ -908,7 +1145,8 @@
     document.getElementById("recordForm").addEventListener("submit", async (event) => {
       event.preventDefault();
       const status = document.getElementById("formStatus");
-      const definition = entityDefinitions[entitySelect.value];
+      const entity = entitySelect.value;
+      const definition = entityDefinitions[entity];
       const values = {};
       definition.fields.forEach((field) => {
         const control = document.getElementById(`field-${field.name}`);
@@ -925,7 +1163,7 @@
         const wasEditing = editingOfferingId !== null;
         const path = wasEditing
           ? `/api/data/course_offerings/${editingOfferingId}`
-          : `/api/data/${entitySelect.value}`;
+          : `/api/data/${entity}`;
         const result = await api(path, {
           method: wasEditing ? "PATCH" : "POST",
           body: JSON.stringify(values)
@@ -935,10 +1173,47 @@
           document.getElementById("submitRecordButton").textContent = "Add record";
           document.getElementById("cancelEditButton").hidden = true;
         }
-        await refreshData();
-        if (entitySelect.value === "time_slots") {
+        if (wasEditing) {
+          await refreshData(["course_offerings", "student_groups"]);
+        } else if (entity === "time_slots") {
+          cachedData.time_slots = result;
+        } else if (entity === "course_offerings") {
+          const offeringFields = [
+            "id", "course_id", "academic_term_id", "instructor_id",
+            "total_students", "weekly_lectures", "weekly_sections",
+            "weekly_labs", "has_lab", "teaching_types"
+          ];
+          cachedData.course_offerings.push(
+            Object.fromEntries(offeringFields.map((field) => [field, result[field]]))
+          );
+          if (result.groups.length) {
+            cachedData.student_groups = cachedData.student_groups.filter(
+              (group) =>
+                group.course_id !== result.course_id ||
+                group.academic_term_id !== result.academic_term_id
+            );
+          }
+          cachedData.student_groups.push(
+            ...result.groups.map((group) => ({
+              ...group,
+              course_id: result.course_id,
+              academic_term_id: result.academic_term_id
+            }))
+          );
+        } else {
+          cachedData[entity].push(result);
+          if (entity === "academic_terms") {
+            const option = document.createElement("option");
+            option.value = result.id;
+            option.textContent = result.name;
+            termSelect.append(option);
+          }
+        }
+        renderFields();
+        renderRecords(entitySelect.value);
+        if (entity === "time_slots") {
           setStatus(status, `Weekly schedule saved: ${result.length} periods.`, "success");
-        } else if (entitySelect.value === "course_offerings") {
+        } else if (entity === "course_offerings") {
           const { lectures, sections, labs } = result.derived_sessions;
           invalidateSchedule(result.timetable_invalidated_terms);
           const action = wasEditing ? "updated" : "saved";
@@ -961,9 +1236,7 @@
       finally { button.disabled = false; button.textContent = "Generate all terms"; }
     });
     renderFields();
-    api("/api/health").then(async () => {
-      await refreshData();
-      const savedSchedule = await api("/api/schedule");
+    Promise.all([refreshData(), api("/api/schedule")]).then(([, savedSchedule]) => {
       if (savedSchedule.sessions.length) {
         renderSchedule(savedSchedule);
         setStatus(
