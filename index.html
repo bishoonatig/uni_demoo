@@ -443,9 +443,7 @@
       const body = document.createElement("tbody");
       const visibleRows = entity === "student_groups" || entity === "time_slots"
         ? rows
-        : entity === "course_offerings"
-          ? [...rows].reverse()
-          : rows.slice(-8).reverse();
+        : [...rows].reverse();
       visibleRows.forEach((row) => {
         const tr = document.createElement("tr");
         columns.forEach((column) => {
