@@ -64,13 +64,17 @@ CREATE TABLE IF NOT EXISTS course_offerings (
     id BIGSERIAL PRIMARY KEY,
     course_id BIGINT NOT NULL REFERENCES courses(id),
     academic_term_id BIGINT NOT NULL REFERENCES academic_terms(id),
-    instructor_id BIGINT NOT NULL REFERENCES instructors(id),
+    instructor_id BIGINT REFERENCES instructors(id),
     total_students INTEGER NOT NULL CHECK (total_students > 0),
     weekly_lectures INTEGER NOT NULL DEFAULT 0 CHECK (weekly_lectures >= 0),
     weekly_sections INTEGER NOT NULL DEFAULT 0 CHECK (weekly_sections >= 0),
     weekly_labs INTEGER NOT NULL DEFAULT 0 CHECK (weekly_labs >= 0),
-    has_lab BOOLEAN NOT NULL DEFAULT FALSE
+    has_lab BOOLEAN NOT NULL DEFAULT FALSE,
+    lecture_online BOOLEAN NOT NULL DEFAULT FALSE
 );
+
+ALTER TABLE course_offerings
+    ALTER COLUMN instructor_id DROP NOT NULL;
 
 ALTER TABLE course_offerings
     DROP CONSTRAINT IF EXISTS course_offerings_course_id_cohort_id_academic_term_id_key;
@@ -81,6 +85,9 @@ DROP INDEX IF EXISTS course_offerings_unique_lab;
 
 ALTER TABLE course_offerings
     ADD COLUMN IF NOT EXISTS has_lab BOOLEAN;
+
+ALTER TABLE course_offerings
+    ADD COLUMN IF NOT EXISTS lecture_online BOOLEAN NOT NULL DEFAULT FALSE;
 
 UPDATE course_offerings
 SET has_lab = (weekly_labs > 0)
@@ -245,11 +252,12 @@ CREATE TABLE IF NOT EXISTS timetable_sessions (
     id BIGSERIAL PRIMARY KEY,
     offering_id BIGINT NOT NULL REFERENCES course_offerings(id) ON DELETE CASCADE,
     academic_term_id BIGINT NOT NULL REFERENCES academic_terms(id),
-    instructor_id BIGINT NOT NULL REFERENCES instructors(id),
-    room_id BIGINT NOT NULL REFERENCES rooms(id),
+    instructor_id BIGINT REFERENCES instructors(id),
+    room_id BIGINT REFERENCES rooms(id),
     time_slot_id BIGINT NOT NULL REFERENCES time_slots(id),
     activity_type VARCHAR(20) NOT NULL CHECK (activity_type IN ('LECTURE', 'SECTION', 'LAB')),
-    session_number INTEGER NOT NULL CHECK (session_number > 0)
+    session_number INTEGER NOT NULL CHECK (session_number > 0),
+    is_online BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 ALTER TABLE timetable_sessions
@@ -259,12 +267,102 @@ ALTER TABLE timetable_sessions
     ADD CONSTRAINT timetable_sessions_activity_type_check
         CHECK (activity_type IN ('LECTURE', 'SECTION', 'LAB'));
 
+ALTER TABLE timetable_sessions
+    ALTER COLUMN room_id DROP NOT NULL,
+    ALTER COLUMN instructor_id DROP NOT NULL,
+    ADD COLUMN IF NOT EXISTS is_online BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS schedule_version SMALLINT NOT NULL DEFAULT 0;
+
+CREATE OR REPLACE FUNCTION validate_session_group()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_activity_type VARCHAR(20);
+    v_room_id BIGINT;
+    v_is_online BOOLEAN;
+    v_capacity INTEGER;
+    v_room_type VARCHAR(20);
+    v_group_limit INTEGER;
+    v_current_groups INTEGER;
+    v_current_students INTEGER;
+    v_new_group_students INTEGER;
+BEGIN
+    SELECT ts.activity_type, ts.room_id, ts.is_online, r.capacity, r.room_type
+    INTO v_activity_type, v_room_id, v_is_online, v_capacity, v_room_type
+    FROM timetable_sessions ts
+    LEFT JOIN rooms r ON r.id = ts.room_id
+    WHERE ts.id = NEW.session_id
+      AND ts.time_slot_id = NEW.time_slot_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Session or time slot not found';
+    END IF;
+
+    IF v_is_online AND v_room_id IS NOT NULL THEN
+        RAISE EXCEPTION 'Online sessions cannot be assigned a room';
+    END IF;
+
+    IF NOT v_is_online AND v_room_id IS NULL THEN
+        RAISE EXCEPTION 'In-person sessions require a room';
+    END IF;
+
+    v_group_limit :=
+        CASE
+            WHEN v_activity_type = 'LECTURE' THEN 2
+            ELSE 1
+        END;
+
+    SELECT COUNT(*),
+           COALESCE(SUM(sg.student_count), 0)
+    INTO v_current_groups, v_current_students
+    FROM session_groups x
+    JOIN student_groups sg ON sg.id = x.group_id
+    WHERE x.session_id = NEW.session_id
+      AND NOT (
+          TG_OP = 'UPDATE'
+          AND x.session_id = OLD.session_id
+          AND x.group_id = OLD.group_id
+      );
+
+    IF v_current_groups >= v_group_limit THEN
+        RAISE EXCEPTION
+            'Maximum group count exceeded for session %',
+            NEW.session_id;
+    END IF;
+
+    SELECT student_count
+    INTO v_new_group_students
+    FROM student_groups
+    WHERE id = NEW.group_id;
+
+    IF NOT v_is_online AND v_current_students + v_new_group_students > v_capacity THEN
+        RAISE EXCEPTION
+            'Room capacity exceeded for session %',
+            NEW.session_id;
+    END IF;
+
+    IF NOT v_is_online AND v_room_type <> v_activity_type THEN
+        RAISE EXCEPTION
+            'Room type does not match session activity type';
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
 CREATE TABLE IF NOT EXISTS session_groups (
     session_id BIGINT NOT NULL REFERENCES timetable_sessions(id) ON DELETE CASCADE,
     time_slot_id BIGINT NOT NULL REFERENCES time_slots(id),
     group_id BIGINT NOT NULL REFERENCES student_groups(id) ON DELETE CASCADE,
     PRIMARY KEY (session_id, time_slot_id, group_id)
 );
+
+DROP TRIGGER IF EXISTS trg_validate_session_group ON session_groups;
+
+CREATE TRIGGER trg_validate_session_group
+    BEFORE INSERT OR UPDATE ON session_groups
+    FOR EACH ROW EXECUTE FUNCTION validate_session_group();
 
 DO $$
 BEGIN

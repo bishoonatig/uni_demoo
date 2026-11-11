@@ -67,6 +67,7 @@
     .field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px 12px; margin-top: 15px; }
     .field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
     .field.full { grid-column: 1 / -1; }
+    .field-search { min-height: 34px; padding: 7px 9px; font-size: 13px; }
     label { color: #465650; font-size: 12px; font-weight: 650; }
     input, select {
       width: 100%; min-width: 0; min-height: 40px; padding: 9px 10px;
@@ -194,7 +195,7 @@
         </div>
         <div class="generator-bar">
           <div class="field"><label for="termSelect">View academic term</label><select id="termSelect"><option value="">Choose a term</option></select></div>
-          <button class="primary" id="generateButton" type="button">Generate all terms</button>
+          <button class="primary" id="generateButton" type="button" disabled>Generate all terms</button>
         </div>
         <div class="status" id="generateStatus" role="status">Generate once to schedule all terms together and avoid instructor or room conflicts.</div>
         <div class="schedule-toolbar" id="scheduleToolbar" hidden>
@@ -226,7 +227,7 @@
       rooms: { label: "Rooms", fields: [{ name: "name", label: "Room name", type: "text" }, { name: "capacity", label: "Capacity", type: "number", min: 1 }, { name: "room_type", label: "Room type", type: "select", options: [{ value: "LECTURE", label: "Lecture" }, { value: "SECTION", label: "Section" }, { value: "LAB", label: "Lab" }] }] },
       time_slots: { label: "Weekly timetable periods", fields: [{ name: "start_time", label: "Day starts", type: "time", value: "08:30" }, { name: "end_time", label: "Day ends", type: "time", value: "20:10" }] },
       student_groups: { label: "Student groups", fields: [], readOnly: true },
-      course_offerings: { label: "Course offerings", fields: [{ name: "course_id", label: "Course", ref: "courses" }, { name: "total_students", label: "Total students in this course", type: "number", min: 1 }, { name: "academic_term_id", label: "Academic term", ref: "academic_terms" }, { name: "instructor_id", label: "Instructor", ref: "instructors" }, { name: "teaching_types", label: "Activities for this course", type: "multi-select", options: [{ value: "lecture", label: "Lecture" }, { value: "section", label: "Section" }, { value: "lab", label: "Lab" }] }] }
+      course_offerings: { label: "Course offerings", fields: [{ name: "course_id", label: "Course", ref: "courses" }, { name: "total_students", label: "Total students in this course", type: "number", min: 1 }, { name: "academic_term_id", label: "Academic term", ref: "academic_terms" }, { name: "instructor_id", label: "Instructor (optional)", ref: "instructors", optional: true }, { name: "teaching_types", label: "Activities for this course", type: "multi-select", options: [{ value: "lecture", label: "Lecture" }, { value: "section", label: "Section" }, { value: "lab", label: "Lab" }] }, { name: "lecture_online", label: "Lecture is online", type: "checkbox", value: false }] }
     };
     const referenceFields = {
       instructors: { department_id: ["Department", "departments"] },
@@ -245,6 +246,7 @@
     let latestSchedule = null;
     let editingOfferingId = null;
     let scheduleSwapSelection = [];
+    let dataReady = false;
 
     function setStatus(element, message, kind = "") {
       element.textContent = message;
@@ -312,6 +314,7 @@
       if (entity === "time_slots" && (key === "start_time" || key === "end_time")) return formatTime(value);
       if (entity === "rooms" && key === "room_type") return value.charAt(0) + value.slice(1).toLowerCase();
       if (entity === "course_offerings" && key === "has_lab") return value ? "Yes" : "No";
+      if (entity === "course_offerings" && key === "lecture_online") return value ? "Yes" : "No";
       if (entity === "course_offerings" && key === "teaching_types") return value.map((type) => type.charAt(0).toUpperCase() + type.slice(1)).join(", ");
       return value ?? "-";
     }
@@ -342,13 +345,38 @@
       control.name = field.name;
       control.required = field.type === "checkbox" ? false : !field.optional;
       if (field.ref) {
-        control.innerHTML = `<option value="">Choose ${field.label.toLowerCase()}</option>`;
+        control.innerHTML = `<option value="">${field.name === "instructor_id" ? "Not assigned" : `Choose ${field.label.toLowerCase()}`}</option>`;
         (cachedData[field.ref] || []).forEach((item) => {
           const option = document.createElement("option");
           option.value = item.id;
           option.textContent = recordLabel(field.ref, item);
           control.append(option);
         });
+        if (field.ref === "courses" || field.ref === "instructors") {
+          const search = document.createElement("input");
+          search.type = "search";
+          search.className = "field-search";
+          search.autocomplete = "off";
+          search.placeholder = field.ref === "courses"
+            ? "Search courses..."
+            : "Search instructors...";
+          search.setAttribute("aria-label", search.placeholder);
+          search.addEventListener("input", () => {
+            const query = search.value.trim().toLocaleLowerCase();
+            Array.from(control.options).forEach((option) => {
+              option.hidden = option.value !== "" &&
+                !option.textContent.toLocaleLowerCase().includes(query);
+            });
+          });
+          control.addEventListener("change", () => {
+            search.value = "";
+            Array.from(control.options).forEach((option) => {
+              option.hidden = false;
+            });
+          });
+          wrapper.append(label, search, control);
+          return wrapper;
+        }
       } else if (field.type === "select" || field.type === "multi-select") {
         if (field.type === "multi-select") control.multiple = true;
         field.options.forEach((entry) => {
@@ -377,6 +405,20 @@
       const definition = entityDefinitions[entitySelect.value];
       document.getElementById("recordForm").hidden = Boolean(definition.readOnly);
       fieldHost.replaceChildren(...definition.fields.map(makeField));
+      if (entitySelect.value === "course_offerings") {
+        document.getElementById("field-teaching_types")
+          .addEventListener("change", updateLectureOnlineControl);
+      }
+      updateLectureOnlineControl();
+    }
+    function updateLectureOnlineControl() {
+      if (entitySelect.value !== "course_offerings") return;
+      const activities = document.getElementById("field-teaching_types");
+      const online = document.getElementById("field-lecture_online");
+      const lectureSelected = Array.from(activities.selectedOptions)
+        .some((option) => option.value === "lecture");
+      online.disabled = !lectureSelected;
+      if (!lectureSelected) online.checked = false;
     }
     function cancelOfferingEdit() {
       editingOfferingId = null;
@@ -394,10 +436,13 @@
           Array.from(control.options).forEach((option) => {
             option.selected = offering.teaching_types.includes(option.value);
           });
+        } else if (field.type === "checkbox") {
+          control.checked = Boolean(offering[field.name]);
         } else {
           control.value = offering[field.name];
         }
       });
+      updateLectureOnlineControl();
       document.getElementById("submitRecordButton").textContent = "Save changes";
       document.getElementById("cancelEditButton").hidden = false;
       setStatus(document.getElementById("formStatus"), "Editing course offering.", "");
@@ -488,7 +533,9 @@
         columns.forEach((column) => {
           const cell = document.createElement("td");
           cell.textContent = column.target
-            ? recordLabel(column.target, getRecord(column.target, row[column.key]))
+            ? column.target === "instructors" && row[column.key] == null
+              ? "Not assigned"
+              : recordLabel(column.target, getRecord(column.target, row[column.key]))
             : displayRecordValue(entity, column.key, row[column.key]);
           tr.append(cell);
         });
@@ -526,6 +573,7 @@
                   body: JSON.stringify({ [attribute]: checkbox.checked })
                 });
                 await refreshData(["instructors"]);
+                if (latestSchedule) renderScheduleView();
                 setStatus(document.getElementById("formStatus"), `${row.name}: ${label} updated.`, "success");
               } catch (error) {
                 checkbox.checked = !checkbox.checked;
@@ -690,6 +738,9 @@
         return scheduleMode.value === "room" && session.room_id === targetId;
       });
     }
+    function sessionIsBiweekly(session) {
+      return Boolean(session.is_biweekly);
+    }
     function scheduleSessionLabel(session) {
       const offering = getRecord("course_offerings", session.offering_id);
       const course = offering && getRecord("courses", offering.course_id);
@@ -704,10 +755,13 @@
       document.getElementById("scheduleSwapSelection").textContent = selected.length
         ? `Selected: ${selected.map(scheduleSessionLabel).join(" ↔ ")}`
         : "";
+      const swapRoomCheckbox = document.getElementById("swapRoomCheckbox");
+      swapRoomCheckbox.disabled = selected.some((session) => session.is_online);
+      if (swapRoomCheckbox.disabled) swapRoomCheckbox.checked = false;
       document.getElementById("swapSessionsButton").disabled =
         selected.length !== 2 ||
         (!document.getElementById("swapTimeCheckbox").checked &&
-          !document.getElementById("swapRoomCheckbox").checked);
+          !swapRoomCheckbox.checked);
     }
     async function swapSelectedScheduleSessions() {
       if (scheduleSwapSelection.length !== 2) return;
@@ -764,28 +818,33 @@
         });
       periodLabel.append(periodSelect);
 
+      let roomSelect = null;
       const roomLabel = document.createElement("label");
-      roomLabel.textContent = "Room";
-      const roomSelect = document.createElement("select");
-      roomSelect.required = true;
-      const sessionStudentCount = session.group_ids.reduce(
-        (total, groupId) =>
-          total + (cachedData.student_groups.find((group) => group.id === groupId)?.student_count || 0),
-        0
-      ) || getRecord("course_offerings", session.offering_id)?.total_students || 0;
-      cachedData.rooms
-        .filter((room) =>
-          room.capacity >= sessionStudentCount &&
-          room.room_type.toLowerCase() === session.activity_type.toLowerCase()
-        )
-        .forEach((room) => {
-          const option = document.createElement("option");
-          option.value = room.id;
-          option.textContent = `${room.name} · ${room.capacity} · ${room.room_type}`;
-          option.selected = room.id === session.room_id;
-          roomSelect.append(option);
-        });
-      roomLabel.append(roomSelect);
+      if (session.is_online) {
+        roomLabel.textContent = "Online";
+      } else {
+        roomLabel.textContent = "Room";
+        roomSelect = document.createElement("select");
+        roomSelect.required = true;
+        const sessionStudentCount = session.group_ids.reduce(
+          (total, groupId) =>
+            total + (cachedData.student_groups.find((group) => group.id === groupId)?.student_count || 0),
+          0
+        ) || getRecord("course_offerings", session.offering_id)?.total_students || 0;
+        cachedData.rooms
+          .filter((room) =>
+            room.capacity >= sessionStudentCount &&
+            room.room_type.toLowerCase() === session.activity_type.toLowerCase()
+          )
+          .forEach((room) => {
+            const option = document.createElement("option");
+            option.value = room.id;
+            option.textContent = `${room.name} · ${room.capacity} · ${room.room_type}`;
+            option.selected = room.id === session.room_id;
+            roomSelect.append(option);
+          });
+        roomLabel.append(roomSelect);
+      }
 
       const actions = document.createElement("div");
       actions.className = "schedule-card-actions";
@@ -808,7 +867,7 @@
             method: "PATCH",
             body: JSON.stringify({
               time_slot_id: Number(periodSelect.value),
-              room_id: Number(roomSelect.value)
+              room_id: roomSelect ? Number(roomSelect.value) : null
             })
           });
           const index = latestSchedule.sessions.findIndex(
@@ -919,11 +978,18 @@
             courseName.textContent = course ? `${course.code} · ${course.name}` : "Course";
             const activity = document.createElement("span");
             const term = getRecord("academic_terms", session.academic_term_id);
-            activity.textContent = scheduleMode.value === "instructor" || scheduleMode.value === "room"
+            const activityLabel = scheduleMode.value === "instructor" || scheduleMode.value === "room"
               ? `${session.activity_type} · ${term?.name || "Term"}`
               : session.activity_type;
+            activity.textContent = sessionIsBiweekly(session)
+              ? `${activityLabel} · Every other week`
+              : activityLabel;
+            const instructor = document.createElement("span");
+            instructor.textContent = `Instructor: ${session.instructor_name || "Not assigned"}`;
             const room = document.createElement("span");
-            room.textContent = `Room: ${roomsById[session.room_id]?.name || "-"}`;
+            room.textContent = session.is_online
+              ? "Online"
+              : `Room: ${roomsById[session.room_id]?.name || "-"}`;
             const groupNames = document.createElement("span");
             groupNames.textContent = `Groups: ${session.group_ids.map((id) => groupsById[id]?.group_label || "?").join(" + ")}`;
             const actions = document.createElement("div");
@@ -962,7 +1028,7 @@
               renderScheduleView();
             });
             actions.append(editButton, deleteButton, swapButton);
-            card.append(courseName, activity, room, groupNames, actions);
+            card.append(courseName, activity, instructor, room, groupNames, actions);
             cell.append(card);
           });
           row.append(cell);
@@ -999,7 +1065,7 @@
       if (!latestSchedule || !scheduleTarget.value) return;
       const canvas = document.createElement("canvas");
       canvas.width = 1800;
-      canvas.height = 1120;
+      canvas.height = 1480;
       const context = canvas.getContext("2d");
       context.fillStyle = "#f4f7f5";
       context.fillRect(0, 0, canvas.width, canvas.height);
@@ -1023,7 +1089,7 @@
       const left = 190;
       const top = 150;
       const columnWidth = 255;
-      const rowHeight = 130;
+      const rowHeight = 180;
       const periods = cachedData.time_slots.filter((slot) => slot.day_of_week === 1).sort((a, b) => a.start_time.localeCompare(b.start_time));
       context.fillStyle = "#176b56";
       context.fillRect(48, top, left - 48, 62);
@@ -1073,11 +1139,12 @@
           sessions.forEach((session, sessionIndex) => {
             const offering = getRecord("course_offerings", session.offering_id);
             const course = offering && getRecord("courses", offering.course_id);
-            const cardY = y + 8 + sessionIndex * 78;
+            const cardY = y + 8 + sessionIndex * 128;
+            const cardHeight = 120;
             context.fillStyle = "#e5f0eb";
-            context.fillRect(x + 7, cardY, columnWidth - 14, 72);
+            context.fillRect(x + 7, cardY, columnWidth - 14, cardHeight);
             context.fillStyle = "#176b56";
-            context.fillRect(x + 7, cardY, 4, 72);
+            context.fillRect(x + 7, cardY, 4, cardHeight);
             context.fillStyle = "#172522";
             context.font = "bold 14px Bahnschrift, sans-serif";
             drawWrappedText(context, course ? `${course.code} · ${course.name}` : "Course", x + 17, cardY + 19, columnWidth - 32, 16, 2);
@@ -1087,8 +1154,11 @@
             const activityLabel = scheduleMode.value === "instructor" || scheduleMode.value === "room"
               ? `${session.activity_type} · ${term?.name || "Term"}`
               : session.activity_type;
-            context.fillText(`${activityLabel} · ${roomsById[session.room_id]?.name || "-"}`, x + 17, cardY + 53);
-            context.fillText(`Groups: ${session.group_ids.map((id) => groupsById[id]?.group_label || "?").join(" + ")}`, x + 17, cardY + 68);
+            const cadenceLabel = sessionIsBiweekly(session) ? " · Every other week" : "";
+            drawWrappedText(context, `${activityLabel}${cadenceLabel}`, x + 17, cardY + 48, columnWidth - 32, 15, 2);
+            drawWrappedText(context, `Instructor: ${session.instructor_name || "Not assigned"}`, x + 17, cardY + 70, columnWidth - 32, 15, 2);
+            context.fillText(`${session.is_online ? "Online" : roomsById[session.room_id]?.name || "-"}`, x + 17, cardY + 101);
+            context.fillText(`Groups: ${session.group_ids.map((id) => groupsById[id]?.group_label || "?").join(" + ")}`, x + 17, cardY + 115);
           });
         });
         context.strokeStyle = "#d7e0dc";
@@ -1150,11 +1220,13 @@
       const values = {};
       definition.fields.forEach((field) => {
         const control = document.getElementById(`field-${field.name}`);
-        if (control.value === "" && field.optional) return;
+        if (control.value === "" && field.optional && !field.ref) return;
         values[field.name] = control.type === "checkbox"
           ? control.checked
           : control.multiple
             ? Array.from(control.selectedOptions, (option) => option.value)
+            : field.ref && control.value === ""
+              ? null
             : control.type === "number" || field.ref
               ? Number(control.value)
               : control.value || null;
@@ -1181,7 +1253,7 @@
           const offeringFields = [
             "id", "course_id", "academic_term_id", "instructor_id",
             "total_students", "weekly_lectures", "weekly_sections",
-            "weekly_labs", "has_lab", "teaching_types"
+            "weekly_labs", "has_lab", "lecture_online", "teaching_types"
           ];
           cachedData.course_offerings.push(
             Object.fromEntries(offeringFields.map((field) => [field, result[field]]))
@@ -1226,6 +1298,10 @@
     document.getElementById("generateButton").addEventListener("click", async () => {
       const status = document.getElementById("generateStatus");
       const button = document.getElementById("generateButton");
+      if (!dataReady) {
+        setStatus(status, "Wait for timetable data to finish loading before generating.", "error");
+        return;
+      }
       button.disabled = true;
       button.textContent = "Solving…";
       try {
@@ -1238,18 +1314,29 @@
     renderFields();
     Promise.all([refreshData(), api("/api/schedule")]).then(([, savedSchedule]) => {
       if (savedSchedule.sessions.length) {
-        renderSchedule(savedSchedule);
-        setStatus(
-          document.getElementById("generateStatus"),
-          `${savedSchedule.scheduled_sessions} saved sessions loaded. Choose a term to view its schedule.`,
-          "success"
-        );
+        if (savedSchedule.is_current) {
+          renderSchedule(savedSchedule);
+          setStatus(
+            document.getElementById("generateStatus"),
+            `${savedSchedule.scheduled_sessions} saved sessions loaded. Choose a term to view its schedule.`,
+            "success"
+          );
+        } else {
+          setStatus(
+            document.getElementById("generateStatus"),
+            "The saved timetable predates the current scheduling rules. Generate a new timetable to apply them.",
+            "error"
+          );
+        }
       }
+      dataReady = true;
+      document.getElementById("generateButton").disabled = false;
       document.getElementById("dbSignal").classList.add("online");
       document.getElementById("dbStatus").textContent = "PostgreSQL connected";
     }).catch((error) => {
-      document.getElementById("dbStatus").textContent = error.message;
-      setStatus(document.getElementById("formStatus"), "Connect PostgreSQL to enter records.", "error");
+      const detail = error instanceof Error ? error.message : String(error);
+      document.getElementById("dbStatus").textContent = `Startup failed: ${detail}`;
+      setStatus(document.getElementById("formStatus"), `Could not load application data: ${detail}`, "error");
     });
   </script>
 </body>
