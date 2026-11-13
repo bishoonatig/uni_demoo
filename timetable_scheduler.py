@@ -49,6 +49,12 @@ MAX_DAILY_SESSIONS = 4
 MIN_DAILY_COURSES = 3
 MAX_ATTENDANCE_DAYS = 5
 MAX_SOLVE_SECONDS = 10.0
+FRIDAY = 5
+SATURDAY = 6
+
+
+def is_seconded_lecture(session: Session) -> bool:
+    return session.friday_available and session.activity_type == "lecture"
 
 
 def generate_schedule(
@@ -58,20 +64,58 @@ def generate_schedule(
     if not sessions:
         return []
 
+    slots_by_day: dict[int, list[TimeSlot]] = {}
+    for slot in time_slots:
+        slots_by_day.setdefault(slot.day_of_week, []).append(slot)
+    for day_slots in slots_by_day.values():
+        day_slots.sort(key=lambda slot: (slot.start_minute, slot.end_minute))
+    next_slot_by_id = {
+        first.time_slot_id: second
+        for day_slots in slots_by_day.values()
+        for first, second in zip(day_slots, day_slots[1:])
+    }
+
     slots_by_session: dict[int, list[TimeSlot]] = {}
+    second_slots_by_session: dict[int, dict[int, TimeSlot]] = {}
     rooms_by_session: dict[int, list[Room]] = {}
     for session in sessions:
         eligible_slots = [
             slot
             for slot in time_slots
-            if slot.day_of_week != 5 or session.friday_available
+            if (
+                slot.day_of_week in (FRIDAY, SATURDAY)
+                if is_seconded_lecture(session) and not session.online
+                else slot.day_of_week != FRIDAY or session.friday_available
+            )
         ]
+        second_slots = (
+            {
+                slot.time_slot_id: next_slot_by_id[slot.time_slot_id]
+                for slot in eligible_slots
+                if slot.time_slot_id in next_slot_by_id
+            }
+            if is_seconded_lecture(session) and not session.online
+            else {}
+        )
+        if is_seconded_lecture(session) and not session.online:
+            eligible_slots = [
+                slot for slot in eligible_slots if slot.time_slot_id in second_slots
+            ]
         if not eligible_slots:
-            raise ScheduleInfeasibleError(
+            detail = (
                 f"Session {session.session_id} has no eligible teaching slots; "
-                "Friday is only available for seconded instructors."
+                "Friday is available only to seconded instructors."
+            )
+            if is_seconded_lecture(session) and not session.online:
+                detail += (
+                    " Offline seconded lectures must be on Friday or Saturday "
+                    "and need two consecutive periods."
+                )
+            raise ScheduleInfeasibleError(
+                detail
             )
         slots_by_session[session.session_id] = eligible_slots
+        second_slots_by_session[session.session_id] = second_slots
         if session.online:
             rooms_by_session[session.session_id] = []
             continue
@@ -116,23 +160,6 @@ def generate_schedule(
         )
         for group_id in set(session.group_ids):
             weekly_group_courses.setdefault(group_id, set()).add(course_id)
-    groups_with_too_few_courses = [
-        group_id
-        for group_id, course_ids in weekly_group_courses.items()
-        if len(course_ids) < MIN_DAILY_COURSES
-    ]
-    if groups_with_too_few_courses:
-        group_loads = ", ".join(
-            f"{group_id} ({len(weekly_group_courses[group_id])} courses)"
-            for group_id in groups_with_too_few_courses[:10]
-        )
-        raise ScheduleInfeasibleError(
-            "Each student group must have at least 3 different courses on every "
-            "day it attends, with no gaps and at least two days off per week. "
-            "These groups have fewer than 3 courses per week: "
-            f"{group_loads}. Add more course offerings for those groups."
-        )
-
     model = cp_model.CpModel()
     resource_intervals: dict[tuple[str, int], list[cp_model.IntervalVar]] = {}
     room_intervals: dict[int, list[cp_model.IntervalVar]] = {}
@@ -144,6 +171,7 @@ def generate_schedule(
         tuple[int, int, int], list[cp_model.IntVar]
     ] = {}
     instructor_day_variables: dict[tuple[int, int], list[cp_model.IntVar]] = {}
+    saturday_seconded_lecture_variables = []
 
     for session in sessions:
         eligible_slots = slots_by_session[session.session_id]
@@ -160,27 +188,47 @@ def generate_schedule(
                 instructor_day_variables.setdefault(
                     (session.instructor_id, slot.day_of_week), []
                 ).append(selected)
+            if (
+                is_seconded_lecture(session)
+                and not session.online
+                and slot.day_of_week == SATURDAY
+            ):
+                saturday_seconded_lecture_variables.append(selected)
             for group_id in set(session.group_ids):
-                group_slot_variables.setdefault(
-                    (group_id, slot.time_slot_id), []
-                ).append(selected)
                 course_id = (
                     session.course_id
                     if session.course_id is not None
                     else session.session_id
                 )
-                group_course_slot_variables.setdefault(
-                    (group_id, course_id, slot.time_slot_id), []
-                ).append(selected)
+                occupied_slots = [slot]
+                second_slot = second_slots_by_session[session.session_id].get(
+                    slot.time_slot_id
+                )
+                if second_slot is not None:
+                    occupied_slots.append(second_slot)
+                for occupied_slot in occupied_slots:
+                    group_slot_variables.setdefault(
+                        (group_id, occupied_slot.time_slot_id), []
+                    ).append(selected)
+                    group_course_slot_variables.setdefault(
+                        (group_id, course_id, occupied_slot.time_slot_id), []
+                    ).append(selected)
         model.AddExactlyOne(slot_variables_list)
 
         starts = [
             slot.day_of_week * 1440 + slot.start_minute for slot in eligible_slots
         ]
         ends = [
-            slot.day_of_week * 1440 + slot.end_minute for slot in eligible_slots
+            slot.day_of_week * 1440
+            + second_slots_by_session[session.session_id].get(
+                slot.time_slot_id, slot
+            ).end_minute
+            for slot in eligible_slots
         ]
-        durations = [slot.end_minute - slot.start_minute for slot in eligible_slots]
+        durations = [
+            end - (slot.day_of_week * 1440 + slot.start_minute)
+            for slot, end in zip(eligible_slots, ends)
+        ]
         start = model.NewIntVar(
             min(starts), max(starts), f"session_{session.session_id}_start"
         )
@@ -201,17 +249,17 @@ def generate_schedule(
         model.Add(
             end
             == sum(
-                (slot.day_of_week * 1440 + slot.end_minute)
+                end
                 * slot_variables[session.session_id][slot.time_slot_id]
-                for slot in eligible_slots
+                for slot, end in zip(eligible_slots, ends)
             )
         )
         model.Add(
             duration
             == sum(
-                (slot.end_minute - slot.start_minute)
+                duration
                 * slot_variables[session.session_id][slot.time_slot_id]
-                for slot in eligible_slots
+                for slot, duration in zip(eligible_slots, durations)
             )
         )
         interval = model.NewIntervalVar(
@@ -322,9 +370,13 @@ def generate_schedule(
                     course_present.Not()
                 )
                 daily_course_variables.append(course_present)
-            model.Add(
-                sum(daily_course_variables) >= MIN_DAILY_COURSES
-            ).OnlyEnforceIf(present)
+            if (
+                day != FRIDAY
+                and len(weekly_group_courses[group_id]) >= MIN_DAILY_COURSES
+            ):
+                model.Add(
+                    sum(daily_course_variables) >= MIN_DAILY_COURSES
+                ).OnlyEnforceIf(present)
 
             for first in range(len(active_by_slot)):
                 for last in range(first + 2, len(active_by_slot)):
@@ -340,16 +392,43 @@ def generate_schedule(
     solver.parameters.max_time_in_seconds = MAX_SOLVE_SECONDS
     solver.parameters.num_search_workers = 1
     solver.parameters.random_seed = 0
+    saturday_lectures = sum(saturday_seconded_lecture_variables)
+    saturday_fallback = None
+    if saturday_seconded_lecture_variables:
+        saturday_fallback = model.NewBoolVar("allow_saturday_seconded_lectures")
+        model.Add(saturday_lectures == 0).OnlyEnforceIf(saturday_fallback.Not())
+        model.AddAssumption(saturday_fallback.Not())
     status = solver.Solve(model)
     if status == cp_model.UNKNOWN:
+        detail = (
+            "Could not determine whether seconded lectures fit on Friday first."
+            if saturday_seconded_lecture_variables
+            else "Reduce the number of sessions or add more eligible rooms and time slots, "
+            "then try again."
+        )
         raise ScheduleTimeoutError(
             f"Could not find a valid timetable within {MAX_SOLVE_SECONDS:g} seconds. "
-            "Reduce the number "
-            "of sessions or add more eligible rooms and time slots, then try again."
+            f"{detail}"
         )
+    if status == cp_model.INFEASIBLE and saturday_fallback is not None:
+        model.ClearAssumptions()
+        model.AddAssumption(saturday_fallback)
+        status = solver.Solve(model)
+        if status == cp_model.UNKNOWN:
+            raise ScheduleTimeoutError(
+                f"Could not find a valid timetable within {MAX_SOLVE_SECONDS:g} seconds. "
+                "Reduce the number of sessions or add more eligible rooms and time slots, "
+                "then try again."
+            )
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        detail = "No valid timetable exists for these sessions, rooms, and time slots."
+        if any(is_seconded_lecture(session) for session in sessions):
+            detail += (
+                " Seconded lectures are restricted to Friday or Saturday, and "
+                "offline lectures need two consecutive periods."
+            )
         raise ScheduleInfeasibleError(
-            "No valid timetable exists for these sessions, rooms, and time slots."
+            detail
         )
 
     assignments = []

@@ -50,9 +50,10 @@ PERIODS_PER_DAY = 6
 PERIOD_DURATION_MINUTES = 100
 BREAK_DURATION_MINUTES = 20
 FRIDAY = 5
+SATURDAY = 6
 TEACHING_DAYS = (1, 2, 3, 4, 5, 6, 7)
 COURSE_ACTIVITY_TYPES = frozenset({"lecture", "section", "lab"})
-TIMETABLE_RULES_VERSION = 2
+TIMETABLE_RULES_VERSION = 3
 
 ENTITIES: dict[str, tuple[str, str, tuple[str, ...]]] = {
     "departments": ("departments", "id", ("name",)),
@@ -123,6 +124,47 @@ def json_value(value: Any) -> Any:
     if isinstance(value, (date, time)):
         return value.isoformat()
     return value
+
+
+def is_seconded_lecture(activity_type: str, friday_available: bool) -> bool:
+    return activity_type == "LECTURE" and friday_available
+
+
+def schedule_slot_window(
+    connection: psycopg.Connection,
+    time_slot_id: int,
+    requires_double_period: bool,
+) -> tuple[int, time, time]:
+    slot = connection.execute(
+        """
+        SELECT day_of_week, start_time, end_time
+        FROM time_slots
+        WHERE id = %s
+        """,
+        (time_slot_id,),
+    ).fetchone()
+    if slot is None:
+        raise HTTPException(status_code=404, detail="Time period not found.")
+    day, start_time, end_time = slot
+    if not requires_double_period:
+        return day, start_time, end_time
+
+    next_period = connection.execute(
+        """
+        SELECT end_time
+        FROM time_slots
+        WHERE day_of_week = %s AND start_time > %s
+        ORDER BY start_time
+        LIMIT 1
+        """,
+        (day, start_time),
+    ).fetchone()
+    if next_period is None:
+        raise HTTPException(
+            status_code=422,
+            detail="An offline lecture by a seconded instructor needs two consecutive periods.",
+        )
+    return day, start_time, next_period[0]
 
 
 def normalize_room_type(value: str) -> str:
@@ -944,6 +986,7 @@ class InstructorPermissionsUpdate(BaseModel):
 class ScheduleSessionUpdate(BaseModel):
     room_id: int | None = None
     time_slot_id: int
+    instructor_id: int | None = None
 
 
 class ScheduleSessionSwap(BaseModel):
@@ -951,6 +994,19 @@ class ScheduleSessionSwap(BaseModel):
     second_session_id: int
     swap_time: bool = True
     swap_room: bool = True
+
+
+def invalidate_instructor_schedule(
+    connection: psycopg.Connection, instructor_id: int
+) -> None:
+    connection.execute(
+        """
+        UPDATE timetable_sessions
+        SET schedule_version = 0
+        WHERE instructor_id = %s
+        """,
+        (instructor_id,),
+    )
 
 
 @app.patch("/api/data/instructors/{instructor_id}/permissions")
@@ -973,6 +1029,8 @@ def update_instructor_permissions(
             row = connection.execute(
                 query, (*updates.values(), instructor_id)
             ).fetchone()
+            if row is not None and "friday_available" in updates:
+                invalidate_instructor_schedule(connection, instructor_id)
     except psycopg.Error as error:
         raise HTTPException(
             status_code=503, detail="Could not update instructor attributes."
@@ -984,6 +1042,7 @@ def update_instructor_permissions(
         "name": row[1],
         "part_time": row[2],
         "friday_available": row[3],
+        "schedule_outdated": "friday_available" in updates,
     }
     return result
 
@@ -1003,13 +1062,20 @@ def update_friday_availability(
                 """,
                 (update.friday_available, instructor_id),
             ).fetchone()
+            if row is not None:
+                invalidate_instructor_schedule(connection, instructor_id)
     except psycopg.Error as error:
         raise HTTPException(
             status_code=503, detail="Could not update instructor availability."
         ) from error
     if row is None:
         raise HTTPException(status_code=404, detail="Instructor not found.")
-    return {"id": row[0], "name": row[1], "friday_available": row[2]}
+    return {
+        "id": row[0],
+        "name": row[1],
+        "friday_available": row[2],
+        "schedule_outdated": True,
+    }
 
 
 def load_saved_schedule_sessions(connection: psycopg.Connection) -> list[dict[str, Any]]:
@@ -1109,6 +1175,25 @@ def update_schedule_session(
                 friday_available,
                 is_online,
             ) = session
+            instructor_id = (
+                update.instructor_id
+                if "instructor_id" in update.model_fields_set
+                else instructor_id
+            )
+            if instructor_id is None:
+                friday_available = False
+            else:
+                instructor = connection.execute(
+                    "SELECT friday_available FROM instructors WHERE id = %s",
+                    (instructor_id,),
+                ).fetchone()
+                if instructor is None:
+                    raise HTTPException(status_code=404, detail="Instructor not found.")
+                friday_available = instructor[0]
+
+            seconded_lecture = is_seconded_lecture(
+                activity_type, friday_available
+            )
             session_group_count = connection.execute(
                 """
                 SELECT SUM(sg.student_count)
@@ -1121,16 +1206,20 @@ def update_schedule_session(
             if session_group_count is not None:
                 student_count = session_group_count
 
-            slot = connection.execute(
-                "SELECT day_of_week FROM time_slots WHERE id = %s",
-                (update.time_slot_id,),
-            ).fetchone()
-            if slot is None:
-                raise HTTPException(status_code=404, detail="Time period not found.")
-            if slot[0] == FRIDAY and not friday_available:
+            day, _, end_time = schedule_slot_window(
+                connection,
+                update.time_slot_id,
+                seconded_lecture and not is_online,
+            )
+            if day == FRIDAY and not friday_available:
                 raise HTTPException(
                     status_code=422,
                     detail="This instructor is not available on Friday.",
+                )
+            if seconded_lecture and not is_online and day not in (FRIDAY, SATURDAY):
+                raise HTTPException(
+                    status_code=422,
+                    detail="A seconded instructor's lecture must be on Friday or Saturday.",
                 )
 
             if is_online and update.room_id is not None:
@@ -1168,11 +1257,29 @@ def update_schedule_session(
                     SELECT 1
                     FROM timetable_sessions other
                     JOIN time_slots other_slot ON other_slot.id = other.time_slot_id
+                    LEFT JOIN instructors other_instructor
+                        ON other_instructor.id = other.instructor_id
                     JOIN time_slots target_slot ON target_slot.id = %s
                     WHERE other.id <> %s
                       AND other_slot.day_of_week = target_slot.day_of_week
-                      AND target_slot.start_time < other_slot.end_time
-                      AND other_slot.start_time < target_slot.end_time
+                      AND target_slot.start_time < CASE
+                          WHEN other.activity_type = 'LECTURE'
+                               AND NOT other.is_online
+                               AND COALESCE(other_instructor.friday_available, FALSE)
+                          THEN COALESCE(
+                              (
+                                  SELECT next_slot.end_time
+                                  FROM time_slots next_slot
+                                  WHERE next_slot.day_of_week = other_slot.day_of_week
+                                    AND next_slot.start_time > other_slot.start_time
+                                  ORDER BY next_slot.start_time
+                                  LIMIT 1
+                              ),
+                              other_slot.end_time
+                          )
+                          ELSE other_slot.end_time
+                      END
+                      AND other_slot.start_time < %s
                       AND (
                           other.room_id = %s
                           OR other.instructor_id = %s
@@ -1197,6 +1304,7 @@ def update_schedule_session(
                 (
                     update.time_slot_id,
                     session_id,
+                    end_time,
                     update.room_id,
                     instructor_id,
                     session_id,
@@ -1222,10 +1330,10 @@ def update_schedule_session(
             connection.execute(
                 """
                 UPDATE timetable_sessions
-                SET room_id = %s, time_slot_id = %s
+                SET room_id = %s, time_slot_id = %s, instructor_id = %s
                 WHERE id = %s
                 """,
-                (update.room_id, update.time_slot_id, session_id),
+                (update.room_id, update.time_slot_id, instructor_id, session_id),
             )
             connection.cursor().executemany(
                 """
@@ -1382,13 +1490,32 @@ def swap_schedule_sessions(update: ScheduleSessionSwap) -> dict[str, Any]:
             ):
                 raise HTTPException(status_code=404, detail="A session time period was not found.")
 
+            assignment_windows: dict[int, tuple[int, time, time]] = {}
             for session_id in session_ids:
                 session = sessions[session_id]
                 assignment = proposed[session_id]
-                if slots[assignment["time_slot_id"]] == FRIDAY and not session["friday_available"]:
+                seconded_lecture = is_seconded_lecture(
+                    session["activity_type"], session["friday_available"]
+                )
+                day, start_time, end_time = schedule_slot_window(
+                    connection,
+                    assignment["time_slot_id"],
+                    seconded_lecture and not session["is_online"],
+                )
+                assignment_windows[session_id] = (day, start_time, end_time)
+                if day == FRIDAY and not session["friday_available"]:
                     raise HTTPException(
                         status_code=422,
                         detail="One of the instructors is not available on Friday.",
+                    )
+                if (
+                    seconded_lecture
+                    and not session["is_online"]
+                    and day not in (FRIDAY, SATURDAY)
+                ):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="A seconded instructor's lecture must be on Friday or Saturday.",
                     )
                 if session["is_online"]:
                     if assignment["room_id"] is not None:
@@ -1420,11 +1547,29 @@ def swap_schedule_sessions(update: ScheduleSessionSwap) -> dict[str, Any]:
                         SELECT 1
                         FROM timetable_sessions other
                         JOIN time_slots other_slot ON other_slot.id = other.time_slot_id
+                        LEFT JOIN instructors other_instructor
+                            ON other_instructor.id = other.instructor_id
                         JOIN time_slots target_slot ON target_slot.id = %s
                         WHERE NOT (other.id = ANY(%s))
                           AND other_slot.day_of_week = target_slot.day_of_week
-                          AND target_slot.start_time < other_slot.end_time
-                          AND other_slot.start_time < target_slot.end_time
+                          AND target_slot.start_time < CASE
+                              WHEN other.activity_type = 'LECTURE'
+                                   AND NOT other.is_online
+                                   AND COALESCE(other_instructor.friday_available, FALSE)
+                              THEN COALESCE(
+                                  (
+                                      SELECT next_slot.end_time
+                                      FROM time_slots next_slot
+                                      WHERE next_slot.day_of_week = other_slot.day_of_week
+                                        AND next_slot.start_time > other_slot.start_time
+                                      ORDER BY next_slot.start_time
+                                      LIMIT 1
+                                  ),
+                                  other_slot.end_time
+                              )
+                              ELSE other_slot.end_time
+                          END
+                          AND other_slot.start_time < %s
                           AND (
                               other.room_id = %s
                               OR other.instructor_id = %s
@@ -1449,6 +1594,7 @@ def swap_schedule_sessions(update: ScheduleSessionSwap) -> dict[str, Any]:
                     (
                         assignment["time_slot_id"],
                         session_ids,
+                        end_time,
                         assignment["room_id"],
                         session["instructor_id"],
                         session_id,
@@ -1460,20 +1606,8 @@ def swap_schedule_sessions(update: ScheduleSessionSwap) -> dict[str, Any]:
                         detail="The swap conflicts with another room, instructor, or student group.",
                     )
 
-            first_slot = connection.execute(
-                """
-                SELECT day_of_week, start_time, end_time
-                FROM time_slots WHERE id = %s
-                """,
-                (proposed[first["id"]]["time_slot_id"],),
-            ).fetchone()
-            second_slot = connection.execute(
-                """
-                SELECT day_of_week, start_time, end_time
-                FROM time_slots WHERE id = %s
-                """,
-                (proposed[second["id"]]["time_slot_id"],),
-            ).fetchone()
+            first_slot = assignment_windows[first["id"]]
+            second_slot = assignment_windows[second["id"]]
             overlap = (
                 first_slot[0] == second_slot[0]
                 and first_slot[1] < second_slot[2]

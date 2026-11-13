@@ -17,6 +17,7 @@ from timetable_scheduler import (
     Room,
     ScheduleInfeasibleError,
     Session,
+    SATURDAY,
     TimeSlot,
     generate_schedule,
 )
@@ -119,19 +120,88 @@ class GenerateScheduleTests(unittest.TestCase):
                 ],
             )
 
-    def test_rejects_student_groups_with_fewer_than_three_weekly_courses(self):
-        with self.assertRaisesRegex(
-            ScheduleInfeasibleError,
-            r"fewer than 3 courses per week.*100 \(2 courses\)",
-        ):
-            generate_schedule(
-                [
-                    Session(1, 10, (100,), 20),
-                    Session(2, 11, (100,), 20),
-                ],
-                self.rooms,
-                self.slots,
+    def test_groups_with_fewer_than_three_weekly_courses_can_take_days_off(self):
+        sessions = [
+            Session(1, 10, (100,), 20),
+            Session(2, 11, (100,), 20),
+        ]
+
+        assignments = generate_schedule(sessions, self.rooms, self.slots)
+
+        self.assertEqual(len(assignments), len(sessions))
+        slots_by_id = {slot.time_slot_id: slot for slot in self.slots}
+        attendance_days = {
+            slots_by_id[assignment.time_slot_id].day_of_week
+            for assignment in assignments
+        }
+        self.assertEqual(len(attendance_days), 1)
+        self.assertGreaterEqual(7 - len(attendance_days), 2)
+
+    def test_friday_is_exempt_from_the_daily_course_minimum(self):
+        sessions = [
+            Session(
+                1, 10, (100,), 20, "lecture",
+                friday_available=True, online=True, course_id=1,
+            ),
+            Session(
+                2, 11, (100,), 20, "lecture",
+                friday_available=True, online=True, course_id=2,
+            ),
+            Session(
+                3, 12, (100,), 20, "lecture", online=True, course_id=3
+            ),
+            Session(
+                4, 13, (100,), 20, "lecture", online=True, course_id=4
+            ),
+            Session(
+                5, 14, (100,), 20, "lecture", online=True, course_id=5
+            ),
+        ]
+        slots = [
+            TimeSlot(1, FRIDAY, 540, 640),
+            TimeSlot(2, FRIDAY, 660, 760),
+            TimeSlot(3, 1, 540, 640),
+            TimeSlot(4, 1, 660, 760),
+            TimeSlot(5, 1, 780, 880),
+        ]
+
+        assignments = generate_schedule(sessions, [], slots)
+        slots_by_id = {slot.time_slot_id: slot for slot in slots}
+        friday_courses = {
+            next(
+                session.course_id
+                for session in sessions
+                if session.session_id == assignment.session_id
             )
+            for assignment in assignments
+            if slots_by_id[assignment.time_slot_id].day_of_week == FRIDAY
+        }
+
+        self.assertEqual(len(friday_courses), 2)
+        monday_courses = {
+            next(
+                session.course_id
+                for session in sessions
+                if session.session_id == assignment.session_id
+            )
+            for assignment in assignments
+            if slots_by_id[assignment.time_slot_id].day_of_week == 1
+        }
+        self.assertEqual(len(monday_courses), 3)
+
+    def test_three_course_minimum_still_applies_on_other_days(self):
+        sessions = [
+            Session(session_id, session_id, (100,), 20, "lecture", course_id=session_id)
+            for session_id in range(1, 4)
+        ]
+        slots = [
+            TimeSlot(1, 1, 540, 640),
+            TimeSlot(2, 1, 660, 760),
+            TimeSlot(3, 2, 540, 640),
+        ]
+
+        with self.assertRaises(ScheduleInfeasibleError):
+            generate_schedule(sessions, self.rooms, slots)
 
     def test_repeated_sessions_of_one_course_count_as_one_daily_course(self):
         sessions = [
@@ -263,11 +333,11 @@ class GenerateScheduleTests(unittest.TestCase):
 
         assignments = generate_schedule(
             [
-                Session(1, 10, (100,), 20, "lecture", friday_available=True),
-                Session(2, 11, (100,), 20, "lecture", friday_available=True),
-                Session(3, 12, (100,), 20, "lecture", friday_available=True),
+                Session(1, 10, (100,), 20, "lecture", friday_available=True, online=True),
+                Session(2, 11, (101,), 20, "lecture", friday_available=True, online=True),
+                Session(3, 12, (102,), 20, "lecture", friday_available=True, online=True),
             ],
-            room,
+            [],
             [
                 friday_slot,
                 TimeSlot(2, FRIDAY, 660, 760),
@@ -275,6 +345,128 @@ class GenerateScheduleTests(unittest.TestCase):
             ],
         )
         self.assertEqual(len(assignments), 3)
+
+    def test_seconded_lectures_prefer_friday_and_fall_back_to_saturday(self):
+        friday_and_saturday = [
+            TimeSlot(1, FRIDAY, 540, 640),
+            TimeSlot(2, FRIDAY, 660, 760),
+            TimeSlot(3, SATURDAY, 540, 640),
+            TimeSlot(4, SATURDAY, 660, 760),
+        ]
+        session = Session(1, 10, (100,), 20, "lecture", friday_available=True)
+
+        friday_assignment = generate_schedule(
+            [session], [Room(1, 30, "LECTURE")], friday_and_saturday
+        )[0]
+        self.assertEqual(friday_assignment.time_slot_id, 1)
+
+        saturday_assignment = generate_schedule(
+            [session],
+            [Room(1, 30, "LECTURE")],
+            [
+                TimeSlot(1, FRIDAY, 540, 640),
+                TimeSlot(2, SATURDAY, 540, 640),
+                TimeSlot(3, SATURDAY, 660, 760),
+            ],
+        )[0]
+        self.assertEqual(saturday_assignment.time_slot_id, 2)
+
+    def test_seconded_lectures_use_saturday_when_friday_periods_are_full(self):
+        sessions = [
+            Session(1, 10, (100,), 20, "lecture", friday_available=True),
+            Session(2, 10, (101,), 20, "lecture", friday_available=True),
+        ]
+        slots = [
+            TimeSlot(1, FRIDAY, 540, 640),
+            TimeSlot(2, FRIDAY, 660, 760),
+            TimeSlot(3, SATURDAY, 540, 640),
+            TimeSlot(4, SATURDAY, 660, 760),
+        ]
+
+        assignments = generate_schedule(
+            sessions,
+            [Room(1, 30, "LECTURE"), Room(2, 30, "LECTURE")],
+            slots,
+        )
+        assigned_days = {
+            next(
+                slot.day_of_week
+                for slot in slots
+                if slot.time_slot_id == assignment.time_slot_id
+            )
+            for assignment in assignments
+        }
+        self.assertEqual(assigned_days, {FRIDAY, SATURDAY})
+
+    def test_offline_seconded_lecture_requires_and_reserves_two_periods(self):
+        session = Session(1, 10, (100,), 20, "lecture", friday_available=True)
+        friday_slots = [
+            TimeSlot(1, FRIDAY, 540, 640),
+            TimeSlot(2, FRIDAY, 660, 760),
+        ]
+
+        assignment = generate_schedule(
+            [session], [Room(1, 30, "LECTURE")], friday_slots
+        )[0]
+        self.assertEqual(assignment.time_slot_id, 1)
+
+        with self.assertRaisesRegex(ScheduleInfeasibleError, "two consecutive periods"):
+            generate_schedule(
+                [session],
+                [Room(1, 30, "LECTURE")],
+                [
+                    TimeSlot(1, FRIDAY, 540, 640),
+                    TimeSlot(2, SATURDAY, 540, 640),
+                ],
+            )
+
+        with self.assertRaises(ScheduleInfeasibleError):
+            generate_schedule(
+                [
+                    session,
+                    Session(2, 11, (100,), 20, "section"),
+                ],
+                [
+                    Room(1, 30, "LECTURE"),
+                    Room(2, 30, "SECTION"),
+                ],
+                [
+                    TimeSlot(1, SATURDAY, 540, 640),
+                    TimeSlot(2, SATURDAY, 660, 760),
+                ],
+            )
+
+    def test_infeasible_seconded_lecture_load_explains_weekend_limits(self):
+        sessions = [
+            Session(1, 10, (100,), 20, "lecture", friday_available=True),
+            Session(2, 10, (101,), 20, "lecture", friday_available=True),
+        ]
+
+        with self.assertRaisesRegex(
+            ScheduleInfeasibleError, "restricted to Friday or Saturday"
+        ):
+            generate_schedule(
+                sessions,
+                [Room(1, 30, "LECTURE"), Room(2, 30, "LECTURE")],
+                [
+                    TimeSlot(1, FRIDAY, 540, 640),
+                    TimeSlot(2, FRIDAY, 660, 760),
+                ],
+            )
+
+    def test_online_seconded_lecture_can_be_scheduled_on_any_day(self):
+        assignments = generate_schedule(
+            [
+                Session(
+                    1, 10, (100,), 20, "lecture", friday_available=True, online=True
+                )
+            ],
+            [],
+            [TimeSlot(1, 1, 540, 640)],
+        )
+
+        self.assertEqual(len(assignments), 1)
+        self.assertEqual(assignments[0].time_slot_id, 1)
 
     def test_online_sessions_are_scheduled_without_rooms(self):
         sessions = [

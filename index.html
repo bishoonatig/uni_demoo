@@ -222,7 +222,7 @@
     const entityDefinitions = {
       departments: { label: "Departments", fields: [{ name: "name", label: "Department name", type: "text" }] },
       academic_terms: { label: "Academic terms", fields: [{ name: "name", label: "Term name", type: "text" }, { name: "start_date", label: "Start date", type: "date", optional: true }, { name: "end_date", label: "End date", type: "date", optional: true }] },
-      instructors: { label: "Instructors", fields: [{ name: "name", label: "Instructor name", type: "text" }, { name: "department_id", label: "Department", ref: "departments", optional: true }, { name: "part_time", label: "Part-time instructor", type: "checkbox", value: false }, { name: "friday_available", label: "Seconded: may teach Friday", type: "checkbox", value: false }] },
+      instructors: { label: "Instructors", fields: [{ name: "name", label: "Instructor name", type: "text" }, { name: "department_id", label: "Department", ref: "departments", optional: true }, { name: "part_time", label: "Part-time instructor", type: "checkbox", value: false }, { name: "friday_available", label: "Seconded: Friday / Saturday lecture fallback", type: "checkbox", value: false }] },
       courses: { label: "Courses", fields: [{ name: "code", label: "Course code", type: "text" }, { name: "name", label: "Course name", type: "text" }, { name: "department_id", label: "Department", ref: "departments" }] },
       rooms: { label: "Rooms", fields: [{ name: "name", label: "Room name", type: "text" }, { name: "capacity", label: "Capacity", type: "number", min: 1 }, { name: "room_type", label: "Room type", type: "select", options: [{ value: "LECTURE", label: "Lecture" }, { value: "SECTION", label: "Section" }, { value: "LAB", label: "Lab" }] }] },
       time_slots: { label: "Weekly timetable periods", fields: [{ name: "start_time", label: "Day starts", type: "time", value: "08:30" }, { name: "end_time", label: "Day ends", type: "time", value: "20:10" }] },
@@ -396,7 +396,7 @@
       if (entitySelect.value === "time_slots" && field.name === "end_time") {
         const hint = document.createElement("span");
         hint.className = "footnote";
-        hint.textContent = "Creates six 100-minute periods per day. Friday is used only for seconded instructors.";
+        hint.textContent = "Creates six 100-minute periods per day. Seconded instructors' lectures use Friday, then Saturday only if needed.";
         wrapper.append(hint);
       }
       return wrapper;
@@ -568,12 +568,22 @@
             checkbox.addEventListener("change", async () => {
               checkbox.disabled = true;
               try {
-                await api(`/api/data/instructors/${row.id}/permissions`, {
+                const result = await api(`/api/data/instructors/${row.id}/permissions`, {
                   method: "PATCH",
                   body: JSON.stringify({ [attribute]: checkbox.checked })
                 });
                 await refreshData(["instructors"]);
-                if (latestSchedule) renderScheduleView();
+                if (latestSchedule) {
+                  if (result.schedule_outdated) {
+                    latestSchedule.is_current = false;
+                    setStatus(
+                      document.getElementById("generateStatus"),
+                      "Instructor availability changed. Generate the timetable again to apply the new rules.",
+                      "error"
+                    );
+                  }
+                  renderScheduleView();
+                }
                 setStatus(document.getElementById("formStatus"), `${row.name}: ${label} updated.`, "success");
               } catch (error) {
                 checkbox.checked = !checkbox.checked;
@@ -731,15 +741,30 @@
         );
       }
       return latestSchedule.sessions.filter((session) => {
-        const offering = getRecord("course_offerings", session.offering_id);
         if (scheduleMode.value === "instructor") {
-          return offering && offering.instructor_id === targetId;
+          return session.instructor_id === targetId;
         }
         return scheduleMode.value === "room" && session.room_id === targetId;
       });
     }
     function sessionIsBiweekly(session) {
       return Boolean(session.is_biweekly);
+    }
+    function scheduleSessionSlotIds(session) {
+      const slotIds = [session.time_slot_id];
+      if (!sessionIsBiweekly(session)) return slotIds;
+      const slot = cachedData.time_slots.find(
+        (item) => item.id === session.time_slot_id
+      );
+      if (!slot) return slotIds;
+      const daySlots = cachedData.time_slots
+        .filter((item) => item.day_of_week === slot.day_of_week)
+        .sort((a, b) => a.start_time.localeCompare(b.start_time));
+      const slotIndex = daySlots.findIndex((item) => item.id === slot.id);
+      if (slotIndex >= 0 && daySlots[slotIndex + 1]) {
+        slotIds.push(daySlots[slotIndex + 1].id);
+      }
+      return slotIds;
     }
     function scheduleSessionLabel(session) {
       const offering = getRecord("course_offerings", session.offering_id);
@@ -796,6 +821,22 @@
       card.replaceChildren();
       const form = document.createElement("form");
       form.className = "schedule-edit";
+
+      const instructorLabel = document.createElement("label");
+      instructorLabel.textContent = "Instructor";
+      const instructorSelect = document.createElement("select");
+      const unassignedOption = document.createElement("option");
+      unassignedOption.value = "";
+      unassignedOption.textContent = "Not assigned";
+      instructorSelect.append(unassignedOption);
+      cachedData.instructors.forEach((instructor) => {
+        const option = document.createElement("option");
+        option.value = instructor.id;
+        option.textContent = instructor.name;
+        option.selected = instructor.id === session.instructor_id;
+        instructorSelect.append(option);
+      });
+      instructorLabel.append(instructorSelect);
 
       const periodLabel = document.createElement("label");
       periodLabel.textContent = "Day and time";
@@ -858,7 +899,7 @@
       cancelButton.textContent = "Cancel";
       cancelButton.addEventListener("click", renderScheduleView);
       actions.append(saveButton, cancelButton);
-      form.append(periodLabel, roomLabel, actions);
+      form.append(instructorLabel, periodLabel, roomLabel, actions);
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
         saveButton.disabled = true;
@@ -866,6 +907,9 @@
           const updated = await api(`/api/schedule/sessions/${session.session_id}`, {
             method: "PATCH",
             body: JSON.stringify({
+              instructor_id: instructorSelect.value
+                ? Number(instructorSelect.value)
+                : null,
               time_slot_id: Number(periodSelect.value),
               room_id: roomSelect ? Number(roomSelect.value) : null
             })
@@ -931,13 +975,14 @@
       const periods = cachedData.time_slots
         .filter((slot) => slot.day_of_week === 1)
         .sort((a, b) => a.start_time.localeCompare(b.start_time));
-      const slotsById = Object.fromEntries(cachedData.time_slots.map((slot) => [slot.id, slot]));
       const roomsById = Object.fromEntries(cachedData.rooms.map((room) => [room.id, room]));
       const groupsById = Object.fromEntries(cachedData.student_groups.map((group) => [group.id, group]));
       const sessionsBySlot = new Map();
       selectedScheduleSessions().forEach((session) => {
-        if (!sessionsBySlot.has(session.time_slot_id)) sessionsBySlot.set(session.time_slot_id, []);
-        sessionsBySlot.get(session.time_slot_id).push(session);
+        scheduleSessionSlotIds(session).forEach((slotId) => {
+          if (!sessionsBySlot.has(slotId)) sessionsBySlot.set(slotId, []);
+          sessionsBySlot.get(slotId).push(session);
+        });
       });
 
       const table = document.createElement("table");
@@ -1117,9 +1162,15 @@
       }
 
       const selectedSessions = selectedScheduleSessions();
-      const slotsById = Object.fromEntries(cachedData.time_slots.map((slot) => [slot.id, slot]));
       const roomsById = Object.fromEntries(cachedData.rooms.map((room) => [room.id, room]));
       const groupsById = Object.fromEntries(cachedData.student_groups.map((group) => [group.id, group]));
+      const sessionsBySlot = new Map();
+      selectedSessions.forEach((session) => {
+        scheduleSessionSlotIds(session).forEach((slotId) => {
+          if (!sessionsBySlot.has(slotId)) sessionsBySlot.set(slotId, []);
+          sessionsBySlot.get(slotId).push(session);
+        });
+      });
       scheduleDayOrder.forEach((day, dayIndex) => {
         const y = top + 62 + dayIndex * rowHeight;
         context.fillStyle = day % 2 ? "#e7efeb" : "#ffffff";
@@ -1135,7 +1186,7 @@
           context.lineWidth = 1.5;
           context.strokeRect(x, y, columnWidth, rowHeight);
           const slot = cachedData.time_slots.find((item) => item.day_of_week === day && item.start_time === period.start_time);
-          const sessions = slot ? selectedSessions.filter((session) => session.time_slot_id === slot.id) : [];
+          const sessions = slot ? (sessionsBySlot.get(slot.id) || []) : [];
           sessions.forEach((session, sessionIndex) => {
             const offering = getRecord("course_offerings", session.offering_id);
             const course = offering && getRecord("courses", offering.course_id);
