@@ -279,32 +279,17 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     v_activity_type VARCHAR(20);
-    v_room_id BIGINT;
-    v_is_online BOOLEAN;
-    v_capacity INTEGER;
-    v_room_type VARCHAR(20);
     v_group_limit INTEGER;
     v_current_groups INTEGER;
-    v_current_students INTEGER;
-    v_new_group_students INTEGER;
 BEGIN
-    SELECT ts.activity_type, ts.room_id, ts.is_online, r.capacity, r.room_type
-    INTO v_activity_type, v_room_id, v_is_online, v_capacity, v_room_type
+    SELECT ts.activity_type
+    INTO v_activity_type
     FROM timetable_sessions ts
-    LEFT JOIN rooms r ON r.id = ts.room_id
     WHERE ts.id = NEW.session_id
       AND ts.time_slot_id = NEW.time_slot_id;
 
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Session or time slot not found';
-    END IF;
-
-    IF v_is_online AND v_room_id IS NOT NULL THEN
-        RAISE EXCEPTION 'Online sessions cannot be assigned a room';
-    END IF;
-
-    IF NOT v_is_online AND v_room_id IS NULL THEN
-        RAISE EXCEPTION 'In-person sessions require a room';
     END IF;
 
     v_group_limit :=
@@ -313,11 +298,9 @@ BEGIN
             ELSE 1
         END;
 
-    SELECT COUNT(*),
-           COALESCE(SUM(sg.student_count), 0)
-    INTO v_current_groups, v_current_students
+    SELECT COUNT(*)
+    INTO v_current_groups
     FROM session_groups x
-    JOIN student_groups sg ON sg.id = x.group_id
     WHERE x.session_id = NEW.session_id
       AND NOT (
           TG_OP = 'UPDATE'
@@ -329,22 +312,6 @@ BEGIN
         RAISE EXCEPTION
             'Maximum group count exceeded for session %',
             NEW.session_id;
-    END IF;
-
-    SELECT student_count
-    INTO v_new_group_students
-    FROM student_groups
-    WHERE id = NEW.group_id;
-
-    IF NOT v_is_online AND v_current_students + v_new_group_students > v_capacity THEN
-        RAISE EXCEPTION
-            'Room capacity exceeded for session %',
-            NEW.session_id;
-    END IF;
-
-    IF NOT v_is_online AND v_room_type <> v_activity_type THEN
-        RAISE EXCEPTION
-            'Room type does not match session activity type';
     END IF;
 
     RETURN NEW;

@@ -160,10 +160,7 @@ def schedule_slot_window(
         (day, start_time),
     ).fetchone()
     if next_period is None:
-        raise HTTPException(
-            status_code=422,
-            detail="An offline lecture by a seconded instructor needs two consecutive periods.",
-        )
+        return day, start_time, end_time
     return day, start_time, next_period[0]
 
 
@@ -1155,12 +1152,8 @@ def update_schedule_session(
         with connect() as connection:
             session = connection.execute(
                 """
-                SELECT ts.instructor_id, ts.activity_type,
-                       co.total_students, COALESCE(i.friday_available, FALSE),
-                       ts.is_online
+                SELECT ts.instructor_id, ts.activity_type, ts.is_online
                 FROM timetable_sessions ts
-                JOIN course_offerings co ON co.id = ts.offering_id
-                LEFT JOIN instructors i ON i.id = ts.instructor_id
                 WHERE ts.id = %s
                 FOR UPDATE OF ts
                 """,
@@ -1168,21 +1161,14 @@ def update_schedule_session(
             ).fetchone()
             if session is None:
                 raise HTTPException(status_code=404, detail="Scheduled session not found.")
-            (
-                instructor_id,
-                activity_type,
-                student_count,
-                friday_available,
-                is_online,
-            ) = session
+            instructor_id, activity_type, is_online = session
             instructor_id = (
                 update.instructor_id
                 if "instructor_id" in update.model_fields_set
                 else instructor_id
             )
-            if instructor_id is None:
-                friday_available = False
-            else:
+            friday_available = False
+            if instructor_id is not None:
                 instructor = connection.execute(
                     "SELECT friday_available FROM instructors WHERE id = %s",
                     (instructor_id,),
@@ -1191,65 +1177,22 @@ def update_schedule_session(
                     raise HTTPException(status_code=404, detail="Instructor not found.")
                 friday_available = instructor[0]
 
+            if update.room_id is not None:
+                room_exists = connection.execute(
+                    "SELECT EXISTS (SELECT 1 FROM rooms WHERE id = %s)",
+                    (update.room_id,),
+                ).fetchone()[0]
+                if not room_exists:
+                    raise HTTPException(status_code=404, detail="Room not found.")
+
             seconded_lecture = is_seconded_lecture(
                 activity_type, friday_available
             )
-            session_group_count = connection.execute(
-                """
-                SELECT SUM(sg.student_count)
-                FROM session_groups session_group
-                JOIN student_groups sg ON sg.id = session_group.group_id
-                WHERE session_group.session_id = %s
-                """,
-                (session_id,),
-            ).fetchone()[0]
-            if session_group_count is not None:
-                student_count = session_group_count
-
-            day, _, end_time = schedule_slot_window(
+            _, _, end_time = schedule_slot_window(
                 connection,
                 update.time_slot_id,
                 seconded_lecture and not is_online,
             )
-            if day == FRIDAY and not friday_available:
-                raise HTTPException(
-                    status_code=422,
-                    detail="This instructor is not available on Friday.",
-                )
-            if seconded_lecture and not is_online and day not in (FRIDAY, SATURDAY):
-                raise HTTPException(
-                    status_code=422,
-                    detail="A seconded instructor's lecture must be on Friday or Saturday.",
-                )
-
-            if is_online and update.room_id is not None:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Online sessions cannot be assigned a room.",
-                )
-            if not is_online and update.room_id is None:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Choose a room for this in-person session.",
-                )
-            if update.room_id is not None:
-                room = connection.execute(
-                    "SELECT capacity, room_type FROM rooms WHERE id = %s",
-                    (update.room_id,),
-                ).fetchone()
-                if room is None:
-                    raise HTTPException(status_code=404, detail="Room not found.")
-                room_capacity, room_type = room
-                if room_capacity < student_count:
-                    raise HTTPException(
-                        status_code=422,
-                        detail=f"The selected room must fit all {student_count} students.",
-                    )
-                if room_type.casefold() != activity_type.casefold():
-                    raise HTTPException(
-                        status_code=422,
-                        detail=f"This session requires a {activity_type.lower()} room.",
-                    )
 
             has_conflict = connection.execute(
                 """
@@ -1393,12 +1336,9 @@ def swap_schedule_sessions(update: ScheduleSessionSwap) -> dict[str, Any]:
             rows = connection.execute(
                 """
                 SELECT ts.id, ts.instructor_id, ts.activity_type,
-                       co.total_students, COALESCE(i.friday_available, FALSE),
                        ts.room_id, ts.is_online, ts.time_slot_id,
                        ts.academic_term_id
                 FROM timetable_sessions ts
-                JOIN course_offerings co ON co.id = ts.offering_id
-                LEFT JOIN instructors i ON i.id = ts.instructor_id
                 WHERE ts.id = ANY(%s)
                 ORDER BY ts.id
                 FOR UPDATE OF ts
@@ -1413,19 +1353,16 @@ def swap_schedule_sessions(update: ScheduleSessionSwap) -> dict[str, Any]:
                     "id": row[0],
                     "instructor_id": row[1],
                     "activity_type": row[2],
-                    "student_count": row[3],
-                    "friday_available": row[4],
-                    "room_id": row[5],
-                    "is_online": row[6],
-                    "time_slot_id": row[7],
-                    "academic_term_id": row[8],
+                    "room_id": row[3],
+                    "is_online": row[4],
+                    "time_slot_id": row[5],
+                    "academic_term_id": row[6],
                 }
                 for row in rows
             }
             group_rows = connection.execute(
                 """
-                SELECT sg.session_id, sg.group_id, student_group.student_count,
-                       student_group.academic_term_id,
+                SELECT sg.session_id, sg.group_id, student_group.academic_term_id,
                        student_group.group_number
                 FROM session_groups sg
                 JOIN student_groups student_group ON student_group.id = sg.group_id
@@ -1435,34 +1372,17 @@ def swap_schedule_sessions(update: ScheduleSessionSwap) -> dict[str, Any]:
             ).fetchall()
             group_ids = {session_id: [] for session_id in session_ids}
             group_keys = {session_id: set() for session_id in session_ids}
-            group_student_counts: dict[int, int] = {}
             for (
                 session_id,
                 group_id,
-                student_count,
                 academic_term_id,
                 group_number,
             ) in group_rows:
                 group_ids[session_id].append(group_id)
                 group_keys[session_id].add((academic_term_id, group_number))
-                group_student_counts[group_id] = student_count
-            for session_id in session_ids:
-                if group_ids[session_id]:
-                    sessions[session_id]["student_count"] = sum(
-                        group_student_counts[group_id]
-                        for group_id in group_ids[session_id]
-                    )
 
             first = sessions[update.first_session_id]
             second = sessions[update.second_session_id]
-            if (
-                update.swap_room
-                and first["is_online"] != second["is_online"]
-            ):
-                raise HTTPException(
-                    status_code=422,
-                    detail="Rooms cannot be swapped between online and in-person sessions.",
-                )
             proposed = {
                 first["id"]: {
                     "room_id": second["room_id"] if update.swap_room else first["room_id"],
@@ -1494,8 +1414,17 @@ def swap_schedule_sessions(update: ScheduleSessionSwap) -> dict[str, Any]:
             for session_id in session_ids:
                 session = sessions[session_id]
                 assignment = proposed[session_id]
+                instructor = (
+                    connection.execute(
+                        "SELECT friday_available FROM instructors WHERE id = %s",
+                        (session["instructor_id"],),
+                    ).fetchone()
+                    if session["instructor_id"] is not None
+                    else None
+                )
                 seconded_lecture = is_seconded_lecture(
-                    session["activity_type"], session["friday_available"]
+                    session["activity_type"],
+                    instructor is not None and instructor[0],
                 )
                 day, start_time, end_time = schedule_slot_window(
                     connection,
@@ -1503,43 +1432,13 @@ def swap_schedule_sessions(update: ScheduleSessionSwap) -> dict[str, Any]:
                     seconded_lecture and not session["is_online"],
                 )
                 assignment_windows[session_id] = (day, start_time, end_time)
-                if day == FRIDAY and not session["friday_available"]:
-                    raise HTTPException(
-                        status_code=422,
-                        detail="One of the instructors is not available on Friday.",
-                    )
-                if (
-                    seconded_lecture
-                    and not session["is_online"]
-                    and day not in (FRIDAY, SATURDAY)
-                ):
-                    raise HTTPException(
-                        status_code=422,
-                        detail="A seconded instructor's lecture must be on Friday or Saturday.",
-                    )
-                if session["is_online"]:
-                    if assignment["room_id"] is not None:
-                        raise HTTPException(
-                            status_code=422,
-                            detail="Online sessions cannot be assigned a room.",
-                        )
-                else:
-                    room = connection.execute(
-                        "SELECT capacity, room_type FROM rooms WHERE id = %s",
+                if assignment["room_id"] is not None:
+                    room_exists = connection.execute(
+                        "SELECT EXISTS (SELECT 1 FROM rooms WHERE id = %s)",
                         (assignment["room_id"],),
-                    ).fetchone()
-                    if room is None:
+                    ).fetchone()[0]
+                    if not room_exists:
                         raise HTTPException(status_code=404, detail="A session room was not found.")
-                    if room[0] < session["student_count"]:
-                        raise HTTPException(
-                            status_code=422,
-                            detail=f"The selected room must fit all {session['student_count']} students.",
-                        )
-                    if room[1].casefold() != session["activity_type"].casefold():
-                        raise HTTPException(
-                            status_code=422,
-                            detail=f"Each session must stay in a {session['activity_type'].lower()} room.",
-                        )
 
                 has_conflict = connection.execute(
                     """
@@ -1622,7 +1521,10 @@ def swap_schedule_sessions(update: ScheduleSessionSwap) -> dict[str, Any]:
                     and proposed[first["id"]]["room_id"]
                     == proposed[second["id"]]["room_id"]
                 )
-                or first["instructor_id"] == second["instructor_id"]
+                or (
+                    first["instructor_id"] is not None
+                    and first["instructor_id"] == second["instructor_id"]
+                )
                 or shared_group
             )
             if overlap and same_resource:

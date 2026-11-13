@@ -781,8 +781,6 @@
         ? `Selected: ${selected.map(scheduleSessionLabel).join(" ↔ ")}`
         : "";
       const swapRoomCheckbox = document.getElementById("swapRoomCheckbox");
-      swapRoomCheckbox.disabled = selected.some((session) => session.is_online);
-      if (swapRoomCheckbox.disabled) swapRoomCheckbox.checked = false;
       document.getElementById("swapSessionsButton").disabled =
         selected.length !== 2 ||
         (!document.getElementById("swapTimeCheckbox").checked &&
@@ -859,33 +857,21 @@
         });
       periodLabel.append(periodSelect);
 
-      let roomSelect = null;
+      const roomSelect = document.createElement("select");
       const roomLabel = document.createElement("label");
-      if (session.is_online) {
-        roomLabel.textContent = "Online";
-      } else {
-        roomLabel.textContent = "Room";
-        roomSelect = document.createElement("select");
-        roomSelect.required = true;
-        const sessionStudentCount = session.group_ids.reduce(
-          (total, groupId) =>
-            total + (cachedData.student_groups.find((group) => group.id === groupId)?.student_count || 0),
-          0
-        ) || getRecord("course_offerings", session.offering_id)?.total_students || 0;
-        cachedData.rooms
-          .filter((room) =>
-            room.capacity >= sessionStudentCount &&
-            room.room_type.toLowerCase() === session.activity_type.toLowerCase()
-          )
-          .forEach((room) => {
-            const option = document.createElement("option");
-            option.value = room.id;
-            option.textContent = `${room.name} · ${room.capacity} · ${room.room_type}`;
-            option.selected = room.id === session.room_id;
-            roomSelect.append(option);
-          });
-        roomLabel.append(roomSelect);
-      }
+      roomLabel.textContent = "Room";
+      const noRoomOption = document.createElement("option");
+      noRoomOption.value = "";
+      noRoomOption.textContent = "No room";
+      roomSelect.append(noRoomOption);
+      cachedData.rooms.forEach((room) => {
+        const option = document.createElement("option");
+        option.value = room.id;
+        option.textContent = `${room.name} · ${room.capacity} · ${room.room_type}`;
+        option.selected = room.id === session.room_id;
+        roomSelect.append(option);
+      });
+      roomLabel.append(roomSelect);
 
       const actions = document.createElement("div");
       actions.className = "schedule-card-actions";
@@ -911,7 +897,7 @@
                 ? Number(instructorSelect.value)
                 : null,
               time_slot_id: Number(periodSelect.value),
-              room_id: roomSelect ? Number(roomSelect.value) : null
+              room_id: roomSelect.value ? Number(roomSelect.value) : null
             })
           });
           const index = latestSchedule.sessions.findIndex(
@@ -1033,7 +1019,7 @@
             instructor.textContent = `Instructor: ${session.instructor_name || "Not assigned"}`;
             const room = document.createElement("span");
             room.textContent = session.is_online
-              ? "Online"
+              ? `Online${session.room_id ? ` · Room: ${roomsById[session.room_id]?.name || "-"}` : ""}`
               : `Room: ${roomsById[session.room_id]?.name || "-"}`;
             const groupNames = document.createElement("span");
             groupNames.textContent = `Groups: ${session.group_ids.map((id) => groupsById[id]?.group_label || "?").join(" + ")}`;
@@ -1208,7 +1194,7 @@
             const cadenceLabel = sessionIsBiweekly(session) ? " · Every other week" : "";
             drawWrappedText(context, `${activityLabel}${cadenceLabel}`, x + 17, cardY + 48, columnWidth - 32, 15, 2);
             drawWrappedText(context, `Instructor: ${session.instructor_name || "Not assigned"}`, x + 17, cardY + 70, columnWidth - 32, 15, 2);
-            context.fillText(`${session.is_online ? "Online" : roomsById[session.room_id]?.name || "-"}`, x + 17, cardY + 101);
+            context.fillText(`${session.is_online ? `Online${session.room_id ? ` · ${roomsById[session.room_id]?.name || "-"}` : ""}` : roomsById[session.room_id]?.name || "-"}`, x + 17, cardY + 101);
             context.fillText(`Groups: ${session.group_ids.map((id) => groupsById[id]?.group_label || "?").join(" + ")}`, x + 17, cardY + 115);
           });
         });
